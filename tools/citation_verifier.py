@@ -68,20 +68,73 @@ _VERIFICATION_PROMPT = """\
 """
 
 
+# ── 自动检测参考文献文件夹的约定路径 ──
+_LITERATURE_FOLDER_CANDIDATES = [
+    "参考文献", "refs", "references", "文献", "papers", "literature",
+]
+
+
+def detect_literature_folder(thesis_path: str) -> Optional[str]:
+    """
+    根据论文路径自动检测参考文献文件夹（约定优于配置）。
+
+    检测顺序（找到第一个存在且含 PDF/Word 文件的即返回）：
+      1. 同名文件夹:      thesis_refs/ 或 thesis_文献/
+      2. 同级约定文件夹:   参考文献/ refs/ references/ 文献/ papers/ literature/
+      3. 子文件夹:         parent/参考文献/ 等
+
+    Returns:
+        检测到的文件夹绝对路径，或 None
+    """
+    thesis_dir = os.path.dirname(os.path.abspath(thesis_path))
+    thesis_stem = os.path.splitext(os.path.basename(thesis_path))[0]
+
+    candidates = []
+
+    # 1. 同名文件夹（如 thesis_refs/、thesis_文献/）
+    for suffix in ["_refs", "_参考文献", "_文献", "_references"]:
+        candidates.append(os.path.join(thesis_dir, thesis_stem + suffix))
+
+    # 2. 同级约定文件夹
+    for name in _LITERATURE_FOLDER_CANDIDATES:
+        candidates.append(os.path.join(thesis_dir, name))
+
+    # 检查每个候选路径
+    supported_ext = {".pdf", ".docx", ".doc"}
+    for folder in candidates:
+        if os.path.isdir(folder):
+            # 确认里面有文献文件
+            has_files = any(
+                os.path.splitext(f)[1].lower() in supported_ext
+                for f in os.listdir(folder)
+            )
+            if has_files:
+                return os.path.abspath(folder)
+
+    return None
+
+
 class VerifyCitationsTool(Tool):
     """
     引用溯源审计工具。
 
-    读取用户的综述/论文正文 → 提取带引用标记的主张句 →
-    在原文文献向量库中检索证据 → LLM 忠实度判决 → 输出审计报告。
+    支持两种使用方式：
+      1. 传入 literature_folder（推荐）→ 自动绑定 + 审计，一步到位
+      2. 传入 ref_sources（高级）→ 手动指定每条引用对应的文献文件路径
+
+    如果两者都未提供，会尝试自动检测论文同级/同名的参考文献文件夹。
     """
 
     name = "verify_citations"
+    # 声明可从 Skill Config / Agent 会话注入的参数
+    injected_configs = ["literature_folder"]
     description = (
         "对综述/论文中的引用进行溯源审计。"
         "提取带引用标记的句子（如'MIMO技术提升30%吞吐量[1]'），"
-        "在对应原文文献中检索相关段落，由 LLM 判断引用是否忠实于原文。"
-        "需要先用 index_document 为每篇被引文献建立索引。\n"
+        "在对应原文文献中检索相关段落，由 LLM 判断引用是否忠实于原文。\n"
+        "使用方式1（推荐）：提供 thesis_path + literature_folder，工具自动匹配参考文献并审计。\n"
+        "使用方式2（高级）：提供 thesis_path + ref_sources（引用编号→文件路径映射）。\n"
+        "如果都不提供 literature_folder 和 ref_sources，会尝试自动检测论文同级的参考文献文件夹。\n"
         "输出：带溯源对比的审计报告，标注 FAITHFUL / MINOR_ISSUE / MAJOR_ISSUE / UNSUPPORTED。"
     )
     parameters = {
@@ -91,10 +144,18 @@ class VerifyCitationsTool(Tool):
                 "type": "string",
                 "description": "用户综述/论文的 Word 文档路径（要审计的文档）",
             },
+            "literature_folder": {
+                "type": "string",
+                "description": (
+                    "存放参考文献 PDF/Word 文件的文件夹路径（推荐）。"
+                    "工具会自动将论文中的 [1],[2],... 与文件夹中的文件匹配并索引。"
+                    "如不提供，会尝试自动检测论文同级的约定文件夹（如 refs/、参考文献/）。"
+                ),
+            },
             "ref_sources": {
                 "type": "object",
                 "description": (
-                    "引用编号 → 原文文献路径的映射。"
+                    "（高级）引用编号 → 原文文献路径的映射，跳过自动匹配。"
                     '例如: {"1": "C:/papers/mimo.docx", "2": "C:/papers/ofdm.pdf"}'
                 ),
             },
@@ -106,8 +167,15 @@ class VerifyCitationsTool(Tool):
                 "type": "integer",
                 "description": "最大审计主张数（控制 API 调用量），默认 20",
             },
+            "annotate": {
+                "type": "boolean",
+                "description": (
+                    "是否将审计结果以 Word 批注形式标注到原文档中，默认 True。"
+                    "开启后，有问题的引用会在 Word 中被添加批注（如‘原文未提及相关信息’）。"
+                ),
+            },
         },
-        "required": ["thesis_path", "ref_sources"],
+        "required": ["thesis_path"],
     }
 
     def __init__(self, llm=None):
@@ -121,13 +189,51 @@ class VerifyCitationsTool(Tool):
     def execute(
         self,
         thesis_path: str,
-        ref_sources: dict,
+        literature_folder: str = "",
+        ref_sources: dict = None,
         top_k: int = 3,
         max_claims: int = 20,
+        annotate: bool = True,
         **kwargs,
     ) -> str:
         if not os.path.exists(thesis_path):
             return f"❌ 综述文档不存在: {thesis_path}"
+
+        # ── 智能参考文献来源解析 ──
+        # 优先级: ref_sources（手动）> literature_folder（用户指定）> 自动检测
+        if not ref_sources:
+            # 尝试从 literature_folder 自动绑定
+            folder = literature_folder.strip() if literature_folder else ""
+
+            # 如果未提供 folder，尝试自动检测
+            if not folder:
+                folder = detect_literature_folder(thesis_path)
+                if folder:
+                    logger.info("[CitationVerifier] 自动检测到参考文献文件夹: %s", folder)
+
+            if not folder:
+                return (
+                    "❌ 未提供参考文献来源。请通过以下方式之一提供：\n"
+                    "  1. literature_folder: 参考文献文件夹路径（推荐，工具自动匹配）\n"
+                    "  2. ref_sources: 引用编号→文件路径映射（高级）\n"
+                    "  3. 将参考文献放在论文同级的 '参考文献/' 或 'refs/' 文件夹中（自动检测）\n\n"
+                    "提示：请告诉我参考文献 PDF/Word 文件所在的文件夹路径。"
+                )
+
+            if not os.path.isdir(folder):
+                return f"❌ 参考文献文件夹不存在: {folder}"
+
+            # 执行自动绑定
+            self.report_progress(2, f"从文件夹自动匹配参考文献: {folder}")
+            ref_sources = self._auto_bind_from_folder(thesis_path, folder)
+            if not ref_sources:
+                return (
+                    f"❌ 自动匹配失败：未能将论文中的参考文献与文件夹 {folder} 中的文件匹配。\n"
+                    "请检查：\n"
+                    "  1. 论文中是否有 [1], [2]... 格式的参考文献段落\n"
+                    "  2. 文件夹中是否有 PDF/Word 文件\n"
+                    "  3. 文件名是否与参考文献标题/作者有一定关联"
+                )
 
         if not ref_sources:
             return "❌ 未提供任何原文文献路径（ref_sources 为空）"
@@ -230,6 +336,14 @@ class VerifyCitationsTool(Tool):
         # ── 5. 编译审计报告 ──
         self.report_progress(92, "生成审计报告...")
         report = self._compile_report(results, len(claims), len(ref_stores))
+
+        # ── 6. Word 批注标注（可选）──
+        if annotate:
+            self.report_progress(95, "正在向 Word 文档添加批注...")
+            annotate_msg = self._annotate_word_document(thesis_path, results)
+            if annotate_msg:
+                report += f"\n\n{annotate_msg}"
+
         self.report_progress(98, "审计完成")
 
         return report
@@ -237,6 +351,243 @@ class VerifyCitationsTool(Tool):
     # ================================================================
     # 内部方法
     # ================================================================
+
+    def _auto_bind_from_folder(self, thesis_path: str, folder: str) -> dict:
+        """
+        从文献文件夹自动匹配参考文献并索引，返回 {ref_key: file_path} 映射。
+        复用 rag.py 的匹配逻辑（_extract_refs_from_thesis / _tokenize_for_match / _match_score）。
+        """
+        from tools.rag import (
+            _extract_refs_from_thesis, _tokenize_for_match,
+            _match_score, _extract_pdf_title, _index_one_literature,
+        )
+
+        # 1. 从论文中提取参考文献列表
+        refs = _extract_refs_from_thesis(thesis_path)
+        if not refs:
+            logger.warning("[CitationVerifier] 未能从论文中提取参考文献条目")
+            return {}
+
+        self.report_progress(5, f"提取到 {len(refs)} 条参考文献，扫描文件夹...")
+
+        # 2. 扫描文件夹中的 PDF/Word 文件
+        supported_ext = {".pdf", ".docx", ".doc"}
+        files = [
+            os.path.join(folder, f) for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in supported_ext
+        ]
+        if not files:
+            return {}
+
+        # 3. 为每个文件预计算 token
+        file_tokens = {}
+        file_titles = {}
+        for fp in files:
+            name_no_ext = os.path.splitext(os.path.basename(fp))[0]
+            tokens = _tokenize_for_match(name_no_ext)
+            title = ""
+            if fp.lower().endswith(".pdf"):
+                title = _extract_pdf_title(fp)
+                if title:
+                    tokens |= _tokenize_for_match(title)
+            file_tokens[fp] = tokens
+            file_titles[fp] = title or name_no_ext
+
+        # 4. 匹配
+        ref_sources = {}
+        used_files = set()
+        threshold = 0.3
+
+        for ref in refs:
+            ref_tokens = _tokenize_for_match(ref["text"])
+            best_path, best_score = "", 0.0
+            for fp, ftokens in file_tokens.items():
+                if fp in used_files:
+                    continue
+                score = _match_score(ref_tokens, ftokens)
+                if score > best_score:
+                    best_score = score
+                    best_path = fp
+            if best_score >= threshold and best_path:
+                ref_sources[ref["key"]] = best_path
+                used_files.add(best_path)
+
+        if not ref_sources:
+            return {}
+
+        # 5. 索引匹配到的文献
+        self.report_progress(10, f"匹配到 {len(ref_sources)} 篇文献，开始索引...")
+        indexed = {}
+        for i, (rk, fp) in enumerate(ref_sources.items()):
+            pct = 10 + int(15 * i / max(len(ref_sources), 1))
+            self.report_progress(pct, f"索引文献 [{rk}]...")
+            try:
+                label = file_titles.get(fp, os.path.basename(fp))
+                _index_one_literature(rk, fp, label)
+                indexed[rk] = fp
+            except Exception as e:
+                logger.warning("[CitationVerifier] 索引文献 [%s] 失败: %s", rk, e)
+
+        logger.info("[CitationVerifier] 自动绑定完成: %d/%d 篇文献",
+                    len(indexed), len(ref_sources))
+        return indexed
+
+    def _annotate_word_document(self, thesis_path: str, results: list[dict]) -> str:
+        """
+        将审计结果以 Word 批注（Comment）形式标注到原文档中。
+
+        只标注有问题的引用（MINOR_ISSUE / MAJOR_ISSUE / UNSUPPORTED / SKIPPED）。
+        使用 Range.Find 定位引用所在句子，添加批注。
+
+        Args:
+            thesis_path: 论文文档路径
+            results: 审计结果列表
+
+        Returns:
+            操作摘要字符串
+        """
+        # 筛选需要批注的结果（只标注有问题的）
+        problem_results = [
+            r for r in results
+            if r.get("verdict") in ("MINOR_ISSUE", "MAJOR_ISSUE", "UNSUPPORTED", "SKIPPED")
+        ]
+        if not problem_results:
+            return "✅ 所有引用均忠实于原文，无需添加批注。"
+
+        # 构造批注文本映射：claim_sentence → comment_text
+        annotations = []
+        for r in problem_results:
+            claim = r.get("claim", "").strip()
+            if not claim:
+                continue
+
+            ref_key = r.get("ref_key", "?")
+            verdict = r.get("verdict", "UNKNOWN")
+            analysis = r.get("analysis", "")
+            issues = r.get("issues", [])
+
+            # 构造批注内容
+            verdict_labels = {
+                "MINOR_ISSUE": "⚠️ 轻微偏差",
+                "MAJOR_ISSUE": "❌ 严重曲解",
+                "UNSUPPORTED": "🚫 原文未提及",
+                "SKIPPED": "⏭️ 文献未索引",
+            }
+            label = verdict_labels.get(verdict, verdict)
+            comment_parts = [f"[引用审计] {label} — 文献[{ref_key}]"]
+            if analysis:
+                comment_parts.append(f"分析: {analysis}")
+            if issues:
+                for iss in issues:
+                    comment_parts.append(f"• {iss}")
+            comment_text = "\n".join(comment_parts)
+
+            annotations.append({
+                "claim": claim,
+                "ref_key": ref_key,
+                "comment": comment_text,
+            })
+
+        if not annotations:
+            return ""
+
+        # 使用 COMSafeLock 安全操作 Word
+        try:
+            from core.com_watchdog import COMSafeLock
+
+            added = 0
+            skipped = 0
+            lock = COMSafeLock(thesis_path, stall_timeout=30.0, read_only=False)
+
+            with lock as (word, doc):
+                lock.heartbeat()
+
+                for ann in annotations:
+                    claim_text = ann["claim"]
+                    comment_text = ann["comment"]
+
+                    # 用 Range.Find 在文档中定位引用句
+                    try:
+                        # 截取引用句的前 255 字符（Word Find 限制）
+                        # 优先搜索包含 [N] 的片段以提高精准度
+                        cite_marker = f"[{ann['ref_key']}]"
+                        search_text = claim_text
+
+                        # 如果句子太长，截取包含引用标记的核心片段
+                        if len(search_text) > 200:
+                            marker_pos = search_text.find(cite_marker)
+                            if marker_pos >= 0:
+                                # 取引用标记周围 100 字符
+                                start = max(0, marker_pos - 80)
+                                end = min(len(search_text), marker_pos + len(cite_marker) + 80)
+                                search_text = search_text[start:end]
+                            else:
+                                search_text = search_text[:200]
+
+                        # 清理搜索文本（去掉可能导致 Find 失败的特殊字符）
+                        search_text = search_text.strip()
+                        if not search_text:
+                            skipped += 1
+                            continue
+
+                        # 创建搜索范围（整个文档）
+                        search_range = doc.Range(0, doc.Content.End)
+                        find_obj = search_range.Find
+                        find_obj.ClearFormatting()
+                        find_obj.Text = search_text
+                        find_obj.MatchWildcards = False
+                        find_obj.MatchWholeWord = False
+                        find_obj.MatchCase = False
+                        find_obj.Forward = True
+                        find_obj.Wrap = 0  # wdFindStop
+
+                        found = find_obj.Execute()
+
+                        if found:
+                            # 在找到的范围上添加批注
+                            doc.Comments.Add(search_range, comment_text)
+                            added += 1
+                            lock.heartbeat()
+                        else:
+                            # 降级策略：只搜索引用标记 [N]
+                            search_range2 = doc.Range(0, doc.Content.End)
+                            find2 = search_range2.Find
+                            find2.ClearFormatting()
+                            find2.Text = cite_marker
+                            find2.MatchWildcards = False
+                            find2.Forward = True
+                            find2.Wrap = 0
+
+                            if find2.Execute():
+                                # 扩展到整个句子再添加批注
+                                # wdSentence = 3
+                                try:
+                                    search_range2.Expand(Unit=3)
+                                except Exception:
+                                    pass
+                                doc.Comments.Add(search_range2, comment_text)
+                                added += 1
+                                lock.heartbeat()
+                            else:
+                                skipped += 1
+
+                    except Exception as e:
+                        logger.warning("[CitationVerifier] 添加批注失败: %s", e)
+                        skipped += 1
+                    finally:
+                        lock.heartbeat()
+
+            summary = f"## 📝 Word 批注标注\n\n已添加 **{added}** 条批注到文档中"
+            if skipped:
+                summary += f"（{skipped} 条未能定位，跳过）"
+            summary += "。\n请在 Word 中查看「审阅 → 批注」面板。"
+            return summary
+
+        except ImportError:
+            return "⚠️ 批注功能需要 win32com（仅 Windows），当前环境不支持。"
+        except Exception as e:
+            logger.error("[CitationVerifier] Word 批注标注失败: %s", e)
+            return f"⚠️ 批注标注失败: {e}\n审计报告已正常生成，但未能将结果写入 Word 批注。"
 
     @staticmethod
     def _read_text(file_path: str) -> str:

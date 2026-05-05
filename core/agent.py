@@ -59,6 +59,7 @@ class Agent:
         self.history: list[Message] = []
         self._session_tools: list[str] = []   # 本轮执行过的工具名
         self._session_file: str = ""           # 本轮操作的文件路径
+        self._session_literature_folder: str = ""  # 本轮参考文献文件夹路径
         self._retry_counts: dict[str, int] = {}  # 工具重试计数器
         self._active_config: dict = {}           # 本轮 Skill config（会话级）
         self._token_warning = 6000   # Token 水位：触发规则压缩（4000→6000，避免过早压缩稀释 L1）
@@ -135,7 +136,7 @@ class Agent:
         )
         # ── 会话级重置：防止跨轮次状态累积 ──
         self._session_tools = []
-        self._session_file = ""
+        self._session_file = (self.memory.get_last_file() if self.memory else "") or ""
         self._retry_counts = {}
         self._active_config = {}
 
@@ -196,12 +197,13 @@ class Agent:
 
                 intent, router_file, reason = classify_intent(
                     self.llm, user_input,
-                    history_context=self._session_file or "",
+                    history_context=self._build_router_context(),
                 )
                 logger.info("🚦 意图: %s — %s", intent.value, reason)
 
                 if router_file:
                     self._session_file = router_file
+                    self._try_detect_literature_folder()
 
                 if intent != TaskIntent.TASK_SIMPLE and self._session_file:
                     return self._run_fsm_pipeline_sync(
@@ -596,6 +598,11 @@ class Agent:
             self._session_tools.append(name)
             if "file_path" in arguments and not self._session_file:
                 self._session_file = arguments["file_path"]
+                # 自动检测参考文献文件夹（基于文档路径约定）
+                self._try_detect_literature_folder()
+            if "literature_folder" in arguments and arguments["literature_folder"]:
+                self._session_literature_folder = arguments["literature_folder"]
+                self._inject_literature_folder()
 
             # ── L2 效用反馈：工具成功 → 奖励召回的 L2 记忆 ──
             if self.memory:
@@ -830,6 +837,77 @@ class Agent:
 
         return injected
 
+    def _try_detect_literature_folder(self):
+        """
+        自动检测参考文献文件夹（基于文档路径约定）。
+
+        当 _session_file 被设置时调用。如果检测到约定文件夹（如同级的
+        参考文献/ 或 refs/ 或 {文档名}_refs/），自动记录并注入 _active_config。
+        """
+        if self._session_literature_folder:
+            return  # 已经有了，不覆盖
+
+        if not self._session_file:
+            return
+
+        try:
+            from tools.citation_verifier import detect_literature_folder
+            detected = detect_literature_folder(self._session_file)
+            if detected:
+                self._session_literature_folder = detected
+                self._inject_literature_folder()
+                logger.info("📂 自动检测到参考文献文件夹: %s", detected)
+        except Exception as e:
+            logger.debug("参考文献文件夹自动检测失败（非致命）: %s", e)
+
+    def _inject_literature_folder(self):
+        """
+        将 _session_literature_folder 注入到 _active_config 中。
+
+        这样声明了 injected_configs = ["literature_folder"] 的工具
+        （如 verify_citations）在执行时会自动获得这个参数。
+        """
+        if self._session_literature_folder:
+            self._active_config["literature_folder"] = self._session_literature_folder
+            if self.verbose:
+                logger.info("⚙️ 参考文献文件夹已注入会话配置: %s",
+                            self._session_literature_folder)
+
+    def _build_router_context(self) -> str:
+        """
+        为路由器构建丰富的上下文字符串。
+
+        汇聚三种信息帮助路由器解析隐式文件引用（如"这个文档"）：
+          1. _session_file（当前会话已知文件路径）
+          2. memory.get_last_file()（持久化的上次处理文件）
+          3. 最近 2 条对话历史摘要（帮助解析指示代词）
+        """
+        parts = []
+
+        # 1. 当前会话文件
+        if self._session_file:
+            parts.append(f"当前会话文件: {self._session_file}")
+
+        # 1.5 参考文献文件夹
+        if self._session_literature_folder:
+            parts.append(f"参考文献文件夹: {self._session_literature_folder}")
+
+        # 2. 记忆系统中的上次文件
+        if self.memory:
+            last_file = self.memory.get_last_file()
+            if last_file and last_file != self._session_file:
+                parts.append(f"上次处理的文件: {last_file}")
+
+            # 3. 最近操作摘要（帮助解析"这个""那个"等指示代词）
+            recent = self.memory.get_recent_sessions(2)
+            if recent:
+                for s in recent:
+                    parts.append(
+                        f"[{s['time']}] 文件: {s['file']}"
+                    )
+
+        return "\n".join(parts)
+
     def reset(self):
         """重置 Agent 状态（保留系统提示词）"""
         system_msg = self.history[0] if self.history else None
@@ -839,6 +917,7 @@ class Agent:
         self.state = AgentState.IDLE
         self._session_tools = []
         self._session_file = ""
+        self._session_literature_folder = ""
         self._retry_counts = {}
         self._active_config = {}
 
@@ -1045,7 +1124,7 @@ class Agent:
         """
         # ── 会话级重置 ──
         self._session_tools = []
-        self._session_file = ""
+        self._session_file = (self.memory.get_last_file() if self.memory else "") or ""
         self._retry_counts = {}
         self._active_config = {}
 
@@ -1094,13 +1173,15 @@ class Agent:
                 yield StreamEvent("text", "🚦 正在分析任务意图...\n")
                 intent, router_file, reason = classify_intent(
                     self.llm, user_input,
-                    history_context=self._session_file or "",
+                    history_context=self._build_router_context(),
                 )
                 yield StreamEvent("text", f"📋 意图: **{intent.value}** — {reason}\n\n")
 
                 # 如果 Router 提取到文件路径，记录到 session
                 if router_file:
                     self._session_file = router_file
+                    # 自动检测参考文献文件夹（基于文档路径约定）
+                    self._try_detect_literature_folder()
 
                 if intent != TaskIntent.TASK_SIMPLE and self._session_file:
                     fsm = TaskFSM(intent, user_input, self._session_file)

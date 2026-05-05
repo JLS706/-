@@ -2,7 +2,7 @@
 name: 文档结构推演
 description: 对无结构的纯文本进行层级推断，还原学术论文的章节结构
 trigger_keywords: [结构, 推演, 结构化, 层级, 章节, 无结构, 一团文字, 没有标题, 纯文本排版, 还原结构, 重建结构, 识别标题]
-tools: [read_document, execute_python, index_document, search_document, close_word]
+tools: [read_document, execute_python, apply_heading_styles, close_word]
 priority: 14
 ---
 
@@ -78,10 +78,31 @@ heading_patterns = [
 
 5. 向用户确认结构是否正确，特别是置信度为 🟡 和 🔴 的推断
 
+### Phase 4: 自动应用标题样式
+
+6. **用户确认后**，调用 `apply_heading_styles` 工具批量应用标题样式：
+
+```json
+// 示例调用参数
+{
+  "file_path": "C:/Users/xxx/论文.docx",
+  "headings": [
+    {"paragraph_index": 3, "level": 1, "text": "1 引言"},
+    {"paragraph_index": 15, "level": 2, "text": "1.1 研究背景"},
+    {"paragraph_index": 28, "level": 2, "text": "1.2 研究目的"},
+    {"paragraph_index": 40, "level": 1, "text": "2 相关工作"}
+  ]
+}
+```
+
+7. 应用完成后，建议用户用 `read_document(section='structure')` 查看最终的标题层级是否正确
+
 ## 注意事项
 
 - **宁可少标不可错标**：不确定的段落保持为正文，不要强行标为标题
+- **必须先确认再应用**：绝对不能跳过 Phase 3 的用户确认步骤直接应用样式
+- `apply_heading_styles` 支持 text 字段做二次校验，建议始终填写以防索引偏移
 - 连续编号的短段落大概率是参考文献
-- 注意区分"节标题"和"段落首句加粗"（纯文本中无法区分，标记为不确定）
+- 注意区分“节标题”和“段落首句加粗”（纯文本中无法区分，标记为不确定）
 - 如果文档不是学术论文格式（如会议记录、技术报告），告知用户并调整推断策略
 - 完成后调用 `close_word` 清理进程

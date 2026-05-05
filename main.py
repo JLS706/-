@@ -88,10 +88,7 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.doc_summarizer import SummarizeDocumentTool
     from tools.doc_format_inspector import InspectDocFormatTool
     from tools.word_cleanup import CloseWordTool
-    from tools.tool_creator import (
-        CreateToolTool, ApproveToolTool, RejectToolTool, ListCustomToolsTool,
-        load_custom_tools,
-    )
+    from tools.heading_styler import ApplyHeadingStylesTool
     from tools.delegate import DelegateTaskTool
 
     # 初始化 LLM
@@ -144,21 +141,12 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(AnalyzeFigureTool(llm=llm))     # 多模态：PDF 图表视觉分析
     registry.register(CloseWordTool())                # Word 进程清理
     registry.register(SummarizeDocumentTool())         # 全文摘要(Map-Reduce)
-    registry.register(CreateToolTool())               # 动态工具创建
-    registry.register(ApproveToolTool(registry))      # 工具审批激活
-    registry.register(RejectToolTool())                # 工具否决销毁
-    registry.register(ListCustomToolsTool())          # 列出自定义工具
-
+    registry.register(ApplyHeadingStylesTool())        # 标题样式批量应用（结构推演后使用）
     # 🐝 蜂群派发器：只有 Coordinator（主 Agent）拥有此工具
     # Worker 通过 registry.exclude({"delegate_task"}) 获得无此工具的子集
     # coordinator_agent 在 Agent 创建后回填（见下方）
     delegate_tool = DelegateTaskTool(llm, registry)
     registry.register(delegate_tool)
-
-    # 自动加载已审批的自定义工具
-    custom_count = load_custom_tools(registry)
-    if custom_count > 0:
-        print(f"📦 已加载 {custom_count} 个自定义工具")
 
     # 初始化 Skills 管理器（复用同一 embed_client）
     from core.skills import SkillManager

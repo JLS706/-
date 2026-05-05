@@ -79,10 +79,17 @@ app = FastAPI(
 class ChatRequest(BaseModel):
     """对话请求"""
     message: str
+    literature_folder: str = ""
 
     model_config = {
         "json_schema_extra": {
-            "examples": [{"message": "帮我检查一下缩写有没有定义"}]
+            "examples": [
+                {"message": "帮我检查一下缩写有没有定义"},
+                {
+                    "message": "帮我审计这篇论文的引用是否准确",
+                    "literature_folder": "C:/papers/my_thesis_refs",
+                },
+            ]
         }
     }
 
@@ -155,6 +162,10 @@ async def chat_stream(req: ChatRequest):
 
     async def event_generator():
         agent_instance.reset()
+        # 如果前端传入了参考文献文件夹，注入到 agent 会话配置
+        if req.literature_folder and req.literature_folder.strip():
+            agent_instance._session_literature_folder = req.literature_folder.strip()
+            agent_instance._inject_literature_folder()
         try:
             async for event in agent_instance.run_async(req.message):
                 payload = json.dumps({
