@@ -29,6 +29,22 @@ import shutil
 
 user32 = ctypes.windll.user32
 
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12       # Alt
+VK_ESCAPE = 0x1B
+VK_V = 0x56
+VK_F4 = 0x73
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+
+_MODIFIER_KEYS = (
+    VK_SHIFT, VK_CONTROL, VK_MENU,
+    0xA0, 0xA1,  # left/right Shift
+    0xA2, 0xA3,  # left/right Ctrl
+    0xA4, 0xA5,  # left/right Alt
+)
+
 # ===========================
 # 基础工具函数
 # ===========================
@@ -67,6 +83,94 @@ def set_clipboard(text):
             time.sleep(0.1)
     return False
 
+def _key_down(vk):
+    user32.keybd_event(vk, 0, 0, 0)
+
+def _key_up(vk):
+    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+def _release_modifier_keys():
+    """释放 Ctrl/Alt/Shift，清掉 SendKeys 或 Alt 抢焦点留下的键盘状态。"""
+    for vk in _MODIFIER_KEYS:
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+    time.sleep(0.05)
+
+def _tap_key(vk):
+    _key_down(vk)
+    time.sleep(0.03)
+    _key_up(vk)
+
+def _send_ctrl_key(vk):
+    """用 Win32 key down/up 发送 Ctrl+指定键，避免 WScript.SendKeys 状态漂移。"""
+    _release_modifier_keys()
+    _key_down(VK_CONTROL)
+    time.sleep(0.04)
+    _key_down(vk)
+    time.sleep(0.04)
+    _key_up(vk)
+    time.sleep(0.04)
+    _key_up(VK_CONTROL)
+    _release_modifier_keys()
+
+def _mathtype_foreground_active(mt_title=""):
+    try:
+        hwnd = user32.GetForegroundWindow()
+        title = win32gui.GetWindowText(hwnd)
+        cls = win32gui.GetClassName(hwnd)
+        return (
+            "EQNWINCLASS" in cls
+            or "MathType" in title
+            or (mt_title and title == mt_title)
+        )
+    except Exception:
+        return False
+
+def safe_paste_to_mathtype(shell, mt_title, retries=3):
+    """
+    安全粘贴到 MathType。
+    保留 Alt 抢焦点机制，但在 Ctrl+V 前释放修饰键并用 Esc 退出菜单激活状态，
+    避免第二个公式开始把 V 解释成 MathType 的 View/视图菜单助记键。
+    """
+    for _ in range(retries):
+        try:
+            shell.AppActivate(mt_title)
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+        if not _mathtype_foreground_active(mt_title):
+            mt_wins = find_windows(class_contains="EQNWINCLASS")
+            if not mt_wins:
+                mt_wins = find_windows(title_contains="MathType")
+            if mt_wins:
+                try:
+                    _force_foreground(mt_wins[0][0])
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        _release_modifier_keys()
+        _tap_key(VK_ESCAPE)
+        time.sleep(0.1)
+        _release_modifier_keys()
+
+        if _mathtype_foreground_active(mt_title):
+            _send_ctrl_key(VK_V)
+            time.sleep(0.8)
+            return True
+
+    return False
+
+def safe_close_mathtype(shell, mt_title):
+    """安全发送 Ctrl+F4 关闭并更新 MathType 对象。"""
+    try:
+        shell.AppActivate(mt_title)
+    except Exception:
+        pass
+    time.sleep(0.2)
+    _release_modifier_keys()
+    _send_ctrl_key(VK_F4)
+
 def _force_foreground(hwnd):
     """
     强制将窗口拉到前台，即使当前进程不是前台进程。
@@ -75,13 +179,10 @@ def _force_foreground(hwnd):
     绕法：模拟一次 Alt 键按下/释放，让系统认为本进程刚收到用户输入，
     从而获得 SetForegroundWindow 权限。
     """
-    VK_MENU = 0x12          # Alt 键虚拟键码
-    KEYEVENTF_EXTENDEDKEY = 0x0001
-    KEYEVENTF_KEYUP       = 0x0002
-
     user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0)
     user32.SetForegroundWindow(hwnd)
     user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+    _release_modifier_keys()
 
 def activate_mathtype_window(shell, max_wait=10):
     """等待并激活 MathType 编辑器窗口。"""
@@ -403,16 +504,21 @@ def convert_one_formula(word, doc, shell, formula_index, skip=False,
     set_clipboard(latex_for_clip)
 
     try:
-        shell.AppActivate(mt_title)
-        time.sleep(0.5)
-        shell.SendKeys("^v")      # Ctrl+V 粘贴
-        time.sleep(0.8)
-        shell.SendKeys("^{F4}")   # Ctrl+F4 关闭并更新
-        _ping(progress_callback, "mathtype_close", formula_index, total_formulas)
-        if not wait_mathtype_closed():
-            print(f"    ❌ MathType 未正常关闭，删除空 OLE 并恢复原始文本")
+        if not safe_paste_to_mathtype(shell, mt_title):
+            print("    [ERROR] MathType paste failed; restoring original formula text")
             _remove_ole_and_restore(word, insert_pos, sel_text)
             return True, False, True
+        safe_close_mathtype(shell, mt_title)
+        _ping(progress_callback, "mathtype_close", formula_index, total_formulas)
+        if not wait_mathtype_closed():
+            print("    [ERROR] MathType did not close normally; restoring original formula text")
+            _remove_ole_and_restore(word, insert_pos, sel_text)
+            return True, False, True
+
+        word.Selection.Start = insert_pos + 1
+        word.Selection.End = insert_pos + 1
+        return True, True, True
+
     except Exception as e:
         print(f"    ❌ 自动化错误: {e}，删除空 OLE 并恢复原始文本")
         _remove_ole_and_restore(word, insert_pos, sel_text)
@@ -632,6 +738,11 @@ def main(progress_callback=None, excluded_indices=None):
         traceback.print_exc()
     finally:
         print("\n脚本运行结束。Word 保持打开状态，请手动检查结果。")
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

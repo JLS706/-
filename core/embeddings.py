@@ -28,22 +28,31 @@ class EmbeddingClient:
 
     # Key 失效的错误信号
     _KEY_ERROR_SIGNALS = [
-        "400", "401", "403",
-        "API_KEY_INVALID", "expired", "invalid",
+        "invalid api key", "invalid_api_key",
+        "API_KEY_INVALID", "expired", "invalid x-goog-api-key",
         "PERMISSION_DENIED", "UNAUTHENTICATED",
+        "unauthorized", "authentication",
     ]
 
-    def __init__(self, api_key: str, base_url: str, model: str = "gemini-embedding-001"):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str = "gemini-embedding-001",
+        timeout: float = 30.0,
+    ):
         from openai import OpenAI
         from core.llm import parse_api_keys
 
         self.model = model
         self.base_url = base_url
+        self.timeout = timeout
         self._api_keys = parse_api_keys(api_key)
         self._current_key_index = 0
         self.client = OpenAI(
             api_key=self._api_keys[self._current_key_index],
             base_url=base_url,
+            timeout=self.timeout,
         )
 
     def _switch_key(self) -> bool:
@@ -55,6 +64,7 @@ class EmbeddingClient:
         self.client = OpenAI(
             api_key=self._api_keys[self._current_key_index],
             base_url=self.base_url,
+            timeout=self.timeout,
         )
         return True
 
@@ -98,7 +108,7 @@ class EmbeddingClient:
             batch = texts[i:i + batch_size]
             def _do(b=batch):
                 resp = self.client.embeddings.create(input=b, model=self.model)
-                sorted_data = sorted(resp.data, key=lambda x: x.index if x.index is not None else -1)
+                sorted_data = sorted(resp.data, key=lambda x: x.index if x.index is not None else len(resp.data))
                 return [d.embedding for d in sorted_data]
             result = self._call_with_failover(_do)
             all_embeddings.extend(result)

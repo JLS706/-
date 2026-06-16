@@ -90,6 +90,10 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.word_cleanup import CloseWordTool
     from tools.heading_styler import ApplyHeadingStylesTool
     from tools.delegate import DelegateTaskTool
+    from tools.tool_creator import (
+        CreateToolTool, ApproveToolTool, ListCustomToolsTool, RejectToolTool,
+        load_custom_tools,
+    )
 
     # 初始化 LLM
     llm_config = config.get("llm", {})
@@ -103,13 +107,14 @@ def create_agent(config: dict, dry_run: bool = False):
             api_key=llm_config.get("api_key", ""),
             base_url=llm_config.get("base_url", ""),
             model=llm_config.get("embedding_model", "gemini-embedding-001"),
+            timeout=llm_config.get("embedding_timeout", 30.0),
         )
     except Exception as e:
         logger.warning("⚠️ Embedding 客户端初始化失败（向量记忆和 RAG 将不可用）: %s", e)
 
     # 初始化本地记忆（含向量记忆）
     memory_dir = os.path.join(PROJECT_ROOT, "memory")
-    memory = Memory(memory_dir, embed_client=embed_client)
+    memory = Memory(memory_dir, embed_client=embed_client, llm=llm)
 
     # 注册所有工具
     registry = ToolRegistry()
@@ -142,6 +147,15 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(CloseWordTool())                # Word 进程清理
     registry.register(SummarizeDocumentTool())         # 全文摘要(Map-Reduce)
     registry.register(ApplyHeadingStylesTool())        # 标题样式批量应用（结构推演后使用）
+    registry.register(CreateToolTool())                # 🧬 动态工具创建
+    registry.register(ApproveToolTool(registry))       # 🧬 审批工具
+    registry.register(ListCustomToolsTool())            # 🧬 列出自定义工具
+    registry.register(RejectToolTool())                # 🧬 否决工具
+    
+    # 自动加载已激活的自定义工具
+    custom_count = load_custom_tools(registry)
+    logger.info("已成功加载 %d 个自定义工具", custom_count)
+
     # 🐝 蜂群派发器：只有 Coordinator（主 Agent）拥有此工具
     # Worker 通过 registry.exclude({"delegate_task"}) 获得无此工具的子集
     # coordinator_agent 在 Agent 创建后回填（见下方）
@@ -254,15 +268,54 @@ async def interactive_loop_async(agent):
         except Exception as e:
             print(f"\n[💥 引擎崩溃] {e}")
 
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description="DocMaster Agent - 学术论文排版 AI 智能体",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Dry-run 模式（不实际执行工具）",
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="测试 LLM 连通性后退出",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", default=None,
+        help="打印详细调试信息（覆盖配置文件）",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="静默模式，减少日志输出（覆盖配置文件）",
+    )
+    return parser.parse_args()
+
 # 将入口函数也改为异步
 async def main_async():
-    # 你的参数解析等逻辑...
+    args = parse_args()
     config = load_config()
-    agent = create_agent(config)
-    
+
+    # --verbose / --quiet 覆盖配置文件中的 verbose 设置
+    if args.quiet:
+        config.setdefault("agent", {})["verbose"] = False
+    elif args.verbose is not None:
+        config.setdefault("agent", {})["verbose"] = True
+
+    # --test: 测试 LLM 连通性后退出
+    if args.test:
+        test_connection(config)
+        return
+
+    agent = create_agent(config, dry_run=args.dry_run)
+
     # 启动异步交互循环
     await interactive_loop_async(agent)
 
+def cli():
+    """CLI 入口点（供 setup.py 的 console_scripts 调用）"""
+    asyncio.run(main_async())
+
 if __name__ == "__main__":
     # 使用 asyncio.run 启动整个异步系统
-    asyncio.run(main_async())
+    cli()

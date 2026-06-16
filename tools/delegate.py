@@ -23,6 +23,7 @@ import uuid
 from core.logger import logger
 from sandbox.workspace import WorkspaceProvider, LocalFolderWorkspace
 from tools.base import Tool
+from tools.submit_report import SubmitReportTool
 
 
 class DelegateTaskTool(Tool):
@@ -85,6 +86,7 @@ class DelegateTaskTool(Tool):
             workspace: 工作区供应商（默认 LocalFolderWorkspace）
             coordinator_agent: Coordinator Agent 实例引用（用于透传 _active_config 给 Worker）
         """
+        super().__init__()
         self._llm = llm
         self._master_registry = tool_registry
         self._workspace = workspace or LocalFolderWorkspace()
@@ -121,6 +123,12 @@ class DelegateTaskTool(Tool):
             close_word = self._master_registry.get("close_word")
             if close_word and not worker_tools.get("close_word"):
                 worker_tools.register(close_word)
+
+            # ── 注入 submit_report 工具（强制结构化报告，绕过文本解析）──
+            # 每个 Worker 独享一个实例，执行完后从实例读取报告 dict，
+            # 完全避免 LLM 在 JSON 前后附加废话导致的解析失败。
+            submit_report_tool = SubmitReportTool()
+            worker_tools.register(submit_report_tool)
 
             # ── 2. 创建隔离工作区（Worker 永远不碰原文件）──
             with self._workspace.session(task_id, target_file) as ctx:
@@ -173,7 +181,7 @@ class DelegateTaskTool(Tool):
                     f"角色: {role}\n"
                     f"目标: {objective}\n"
                     f"文件: {work_path}\n\n"
-                    f"完成后输出 JSON 格式的报告。"
+                    f"完成后调用 submit_report 工具提交结构化报告，不要在文本中输出 JSON。"
                 )
 
                 # 用 asyncio.run() 在本线程起新事件循环，
@@ -260,8 +268,73 @@ class DelegateTaskTool(Tool):
                 self.report_progress(95, f"[Worker:{role}] 输出报告中...")
 
                 # ── 6. 提取报告，决定是否回写原文件 ──
-                report = self._extract_report(raw_result, role, objective)
-                report_dict = json.loads(report)
+                # 优先：Worker 通过 submit_report 工具提交的结构化报告（零解析风险）
+                # 回退：从 Worker 文本输出中正则提取 JSON（旧方案，兜底）
+                if submit_report_tool.was_called():
+                    report_dict = submit_report_tool.get_report()
+                    report = json.dumps(report_dict, ensure_ascii=False, indent=2)
+                    logger.info(
+                        "[Delegate] 📋 使用 submit_report 工具报告 (status=%s)",
+                        report_dict.get("status"),
+                    )
+                else:
+                    # ── 强制重试：用 tool_choice 逼 LLM 调用 submit_report ──
+                    # 比直接降级到文本解析可靠得多：LLM 通过 tool_calls 返回
+                    # 结构化参数，框架层直接拿到 dict，零解析风险。
+                    logger.warning(
+                        "[Delegate] ⚠️ Worker 未调用 submit_report，强制重试..."
+                    )
+                    self.report_progress(96, f"[Worker:{role}] 强制提交报告...")
+
+                    forced_ok = False
+                    try:
+                        from core.schema import Message as _Msg, Role as _Role
+                        retry_messages = [
+                            _Msg(role=_Role.SYSTEM, content=(
+                                "你是报告提交助手。根据 Worker 的执行结果，"
+                                "调用 submit_report 工具提交结构化报告。"
+                            )),
+                            _Msg(role=_Role.USER, content=(
+                                f"Worker 角色: {role}\n"
+                                f"Worker 目标: {objective}\n"
+                                f"Worker 输出:\n{raw_result[:2000]}\n\n"
+                                "请根据上述输出，调用 submit_report 工具提交报告。"
+                            )),
+                        ]
+                        # 只暴露 submit_report 一个工具 + 强制调用
+                        retry_response = self._llm.chat(
+                            retry_messages,
+                            tools=[submit_report_tool.to_openai_tool()],
+                            tool_choice={
+                                "type": "function",
+                                "function": {"name": "submit_report"},
+                            },
+                        )
+                        if retry_response.tool_calls:
+                            tc = retry_response.tool_calls[0]
+                            if tc.name == "submit_report":
+                                submit_report_tool.execute(**tc.arguments)
+                                forced_ok = True
+                                logger.info(
+                                    "[Delegate] ✅ 强制重试成功，submit_report 已调用"
+                                )
+                    except Exception as e:
+                        logger.warning("[Delegate] 强制重试失败: %s", e)
+
+                    if forced_ok and submit_report_tool.was_called():
+                        report_dict = submit_report_tool.get_report()
+                        report = json.dumps(report_dict, ensure_ascii=False, indent=2)
+                        logger.info(
+                            "[Delegate] 📋 使用强制重试报告 (status=%s)",
+                            report_dict.get("status"),
+                        )
+                    else:
+                        # 最后兜底：文本解析（极端情况）
+                        logger.warning(
+                            "[Delegate] ⚠️ 强制重试也失败，降级到文本解析"
+                        )
+                        report = self._extract_report(raw_result, role, objective)
+                        report_dict = json.loads(report)
 
                 if report_dict.get("status") == "PASS":
                     # 双重保险：优先用 Worker 报告的 output_path，回退到 work_path
@@ -304,18 +377,47 @@ class DelegateTaskTool(Tool):
         从 Worker 的原始输出中提取 JSON 报告。
 
         Worker 被要求输出 JSON，但 LLM 可能在前后加了废话。
-        用贪心匹配提取第一个 {...} 块。如果找不到，包装为降级报告。
+        策略：从尾部向前扫描，尝试找到包含 "status" 字段的最后一个
+        完整 JSON 对象。这比贪心正则更鲁棒——贪心 `{[\\s\\S]*}` 会
+        从第一个 `{` 匹配到最后一个 `}`，当 Worker 输出中包含多个
+        JSON 片段（如工具中间日志 + 最终报告）时必然失败。
         """
-        # 尝试提取 JSON 块
+        # ── 策略 1: 从尾部向前查找包含 "status" 的 JSON 块 ──
+        # 先用非贪心正则提取所有独立的 {...} 块，然后从后往前尝试解析
         import re
-        json_match = re.search(r'\{[\s\S]*\}', raw_result)
+        # 非贪心匹配 + 允许嵌套（通过匹配平衡括号的方式）
+        # 回退方案：逐个尝试从每个 `{` 开始的子串
+        candidates = []
+        depth = 0
+        start = -1
+        for i, ch in enumerate(raw_result):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(raw_result[start:i + 1])
+                    start = -1
+
+        # 从后往前尝试解析（最后一个 JSON 块最可能是最终报告）
+        for candidate in reversed(candidates):
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict) and "status" in parsed:
+                    return json.dumps(parsed, ensure_ascii=False, indent=2)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+        # ── 策略 2: 兜底 — 尝试非贪心正则（处理简单情况）──
+        json_match = re.search(r'\{[^{}]*"status"\s*:\s*"[^"]*"[^{}]*\}', raw_result)
         if json_match:
             try:
                 parsed = json.loads(json_match.group())
-                # 验证必要字段存在
                 if "status" in parsed:
                     return json.dumps(parsed, ensure_ascii=False, indent=2)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 pass
 
         # JSON 提取失败 → 降级为文本报告

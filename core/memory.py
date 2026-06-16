@@ -50,21 +50,86 @@ L2_CAPACITY = 50           # L2 最大条目数
 CONFLICT_THRESHOLD = 0.92  # 语义冲突阈值（0.85→0.92: 短中文文本天然相似度高，调高减少误杀）
 PROMOTION_THRESHOLD = 5    # L3 → L2 晋升所需召回次数
 
+# ── 记忆清洗：移除不应被记忆的临时信息（文件路径、会话 ID 等）──
+import re as _re
+_PATH_PATTERN = _re.compile(
+    r'[A-Za-z]:\\(?:[^\\/:*?"<>|]+\\)*[^\s\\/:*?"<>|]+\.\w{1,5}'  # Windows 绝对路径
+    r'|/(?:home|Users|tmp|var|mnt)/\S+'                                # Unix 绝对路径
+)
+
+
+def _sanitize_for_memory(text: str) -> str:
+    """
+    清洗记忆文本：将绝对文件路径替换为文件名。
+    
+    避免路径这类会话级临时信息被存入长期记忆污染后续会话。
+    保留文件名（有语义价值），去掉目录路径（无复用价值且会误导）。
+    """
+    def _replace(m):
+        path = m.group(0)
+        basename = path.rsplit('\\', 1)[-1].rsplit('/', 1)[-1]
+        return basename
+    return _PATH_PATTERN.sub(_replace, text)
+
 
 class Memory:
     """三级分层记忆管理器"""
 
-    def __init__(self, memory_dir: str = "memory", embed_client=None):
+    def __init__(self, memory_dir: str = "memory", embed_client=None, llm=None):
         self.memory_dir = os.path.abspath(memory_dir)
         self.history_file = os.path.join(self.memory_dir, "history.json")
         self._data = self._load()
+
+        # ── LLM 实例（用于 L2 冲突融合判断，复用外部实例避免重复创建）──
+        self._llm = llm
 
         # ── 向量记忆 ──
         self.embed_client = embed_client
         self._vector_store = None
         self._vector_cache_path = os.path.join(self.memory_dir, "memory_vectors.json")
-        self._last_recalled_l2_indices: list[int] = []  # 本轮召回的 L2 索引（用于反馈）
+        self._last_recalled_l2_texts: list[str] = []  # 本轮召回的 L2 文本（用于反馈，避免索引偏移）
         self._load_vector_store()
+
+    def _project_key(self, current_file: str = "") -> str:
+        """Return the stable memory scope key for a document-backed project."""
+        if not current_file:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(os.path.expanduser(current_file)))
+        except (TypeError, ValueError):
+            return ""
+
+    def _same_project(self, metadata: dict, project_id: str) -> bool:
+        """When a current document exists, keep vector memory scoped to it."""
+        if not project_id:
+            return True
+        return metadata.get("project_id") == project_id
+
+    def _sanitize_active_file(self, text: str, current_file: str = "") -> str:
+        """
+        清洗记忆/查询文本：
+        1. 将绝对路径清洗为文件名本身。
+        2. 将当前/最后处理的文件名（及去后缀名称）替换为通用占位符 <DOC>，消除文件名干扰。
+        """
+        if not text:
+            return ""
+        
+        # 1. 清洗绝对路径
+        text = _sanitize_for_memory(text)
+        
+        # 2. 识别并替换当前/最后处理的文件名
+        active_file = current_file or self.get_last_file()
+        if active_file:
+            basename = os.path.basename(active_file)
+            name_no_ext, _ = os.path.splitext(basename)
+            
+            # 从长到短替换，防止部分替换
+            targets = sorted(list({basename, name_no_ext}), key=len, reverse=True)
+            for target in targets:
+                if len(target) > 2:  # 避免替换过短的误伤
+                    escaped = _re.escape(target)
+                    text = _re.sub(escaped, "<DOC>", text, flags=_re.IGNORECASE)
+        return text
 
     def _load_vector_store(self):
         """从缓存加载向量记忆（如果存在）"""
@@ -159,9 +224,26 @@ class Memory:
             return sessions[-1].get("file")
         return None
 
-    def get_context_summary(self, recalled_context: str = "") -> str:
-        """生成记忆摘要，注入到 System Prompt 中"""
-        recent = self.get_recent_sessions(3)
+    def get_context_summary(self, recalled_context: str = "",
+                            current_file: str = "") -> str:
+        """
+        生成记忆摘要，注入到 System Prompt 中。
+
+        Args:
+            recalled_context: 向量记忆召回的相关上下文
+            current_file: 当前活跃文档路径（由调用方传入）。
+                若提供，则只展示与该文档相关的历史记录，
+                且不注入 last_file（避免旧路径污染新会话）。
+        """
+        # 按当前文档过滤历史记录
+        recent = self.get_recent_sessions(5)
+        if current_file:
+            current_abs = os.path.abspath(current_file)
+            recent = [s for s in recent if os.path.abspath(s.get("file", "")) == current_abs]
+            recent = recent[-3:]  # 最多 3 条
+        else:
+            recent = recent[-3:]
+
         if not recent and not recalled_context:
             return ""
 
@@ -181,10 +263,8 @@ class Memory:
                     f"操作: {actions_str} | {s['summary']}"
                 )
 
-        last_file = self.get_last_file()
+        # 用户偏好（不含文件路径——文件路径由调用方控制，不属于偏好）
         pref_lines = []
-        if last_file:
-            pref_lines.append(f"- 上次处理的文件: {last_file}")
         for k, v in self._data["preferences"].items():
             pref_lines.append(f"- {k}: {v}")
 
@@ -197,7 +277,8 @@ class Memory:
     # L3: Short-term Conversation (短期对话记忆)
     # ═════════════════════════════════════════════
 
-    def add_conversation(self, user_input: str, agent_reply: str):
+    def add_conversation(self, user_input: str, agent_reply: str,
+                         current_file: str = ""):
         """
         将一轮对话存入 L3 短期记忆（含层感知语义冲突消解）。
 
@@ -209,7 +290,12 @@ class Memory:
             return
 
         # 去掉模板化前缀，减少不同对话间 embedding 的基础相似度
-        summary = f"{user_input[:200]} → {agent_reply[:300]}"
+        # 脱敏文件名与绝对路径 → 消除文件名串扰与路径污染
+        project_id = self._project_key(current_file)
+        summary = self._sanitize_active_file(
+            f"{user_input[:200]} → {agent_reply[:300]}",
+            current_file=current_file,
+        )
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         try:
@@ -221,13 +307,14 @@ class Memory:
                 import numpy as np
                 query_vec = np.array(embedding)
                 for i in range(len(self._vector_store.chunks)):
+                    old_meta = self._vector_store.metadata[i]
+                    if not self._same_project(old_meta, project_id):
+                        continue
                     score = cosine_similarity(
                         query_vec, self._vector_store.embeddings[i]
                     )
                     if score > CONFLICT_THRESHOLD:
-                        old_type = self._vector_store.metadata[i].get(
-                            "type", "conversation"
-                        )
+                        old_type = old_meta.get("type", "conversation")
                         if old_type == "conversation":
                             # L3 → L3: 同层替换
                             logger.debug(
@@ -241,6 +328,7 @@ class Memory:
                                 "time": now_str,
                                 "recall_count": 0,
                                 "last_recalled": None,
+                                "project_id": project_id,
                             }
                             self._vector_store.save_cache(
                                 self._vector_cache_path
@@ -261,6 +349,7 @@ class Memory:
                 "time": now_str,
                 "recall_count": 0,
                 "last_recalled": None,
+                "project_id": project_id,
             }]
             self._vector_store.add([summary], [embedding], metadata)
             self._vector_store.save_cache(self._vector_cache_path)
@@ -271,9 +360,10 @@ class Memory:
         except Exception as e:
             logger.warning("  [Memory] L3 存储失败(不影响主功能): %s", e)
 
-    def add_to_vector(self, user_input: str, agent_reply: str):
+    def add_to_vector(self, user_input: str, agent_reply: str,
+                      current_file: str = ""):
         """向后兼容：代理到 add_conversation()"""
-        self.add_conversation(user_input, agent_reply)
+        self.add_conversation(user_input, agent_reply, current_file=current_file)
 
     # ═════════════════════════════════════════════
     # L2: Long-term RAG (长期向量记忆)
@@ -300,16 +390,21 @@ class Memory:
             result_text: 最终要写入的经验文本
         """
         try:
-            import toml
-            from core.llm import LLM
             from core.schema import Message, Role
 
-            config_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                "config", "config.toml",
-            )
-            config = toml.load(config_path)
-            llm = LLM(**config.get("llm", {}))
+            # 优先复用外部传入的 LLM 实例，避免每次冲突都重新读配置 + 创建客户端
+            llm = self._llm
+            if llm is None:
+                import toml
+                from core.llm import LLM
+                config_path = os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "config", "config.toml",
+                )
+                config = toml.load(config_path)
+                llm = LLM(**config.get("llm", {}))
+                # 缓存以供后续调用复用
+                self._llm = llm
 
             messages = [
                 Message(role=Role.SYSTEM, content=(
@@ -352,9 +447,10 @@ class Memory:
             )
             return "replace", new_text
 
-    def add_reflection(self, experience_text: str):
+    def add_reflection(self, experience_text: str, current_file: str = ""):
         """
         将反思经验存入 L2 长期记忆（含层感知冲突消解）。
+        入库前自动清洗绝对路径，防止会话级临时路径成为永久记忆。
 
         冲突规则:
           - 与 L2 冲突 (>0.85): 替换旧 L2（同层覆盖）
@@ -364,9 +460,14 @@ class Memory:
             return
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        project_id = self._project_key(current_file)
 
         try:
-            embedding = self.embed_client.embed(experience_text)
+            experience_text = self._sanitize_active_file(
+                experience_text,
+                current_file=current_file,
+            )
+            query_embedding = self.embed_client.embed(experience_text)
 
             # ── 层感知冲突消解 ──
             l3_to_delete = []  # 要清理的 L3 索引
@@ -374,15 +475,16 @@ class Memory:
             if len(self._vector_store) > 0:
                 from core.embeddings import cosine_similarity
                 import numpy as np
-                query_vec = np.array(embedding)
+                query_vec = np.array(query_embedding)
                 for i in range(len(self._vector_store.chunks)):
+                    old_meta = self._vector_store.metadata[i]
+                    if not self._same_project(old_meta, project_id):
+                        continue
                     score = cosine_similarity(
                         query_vec, self._vector_store.embeddings[i]
                     )
                     if score > CONFLICT_THRESHOLD:
-                        old_type = self._vector_store.metadata[i].get(
-                            "type", "conversation"
-                        )
+                        old_type = old_meta.get("type", "conversation")
                         if old_type == "reflection":
                             # L2 → L2: 融合节点判断
                             old_text = self._vector_store.chunks[i]
@@ -406,6 +508,7 @@ class Memory:
                                 "source": "task_completion_hook",
                                 "fused_from": action,
                                 "utility_score": 1.0,
+                                "project_id": project_id,
                             }
                             l2_replaced = True
                             break
@@ -428,15 +531,16 @@ class Memory:
 
             # 无冲突 → 正常追加 L2
             import numpy as np
-            query_vec = np.array(embedding)
+            query_vec = np.array(query_embedding)
             metadata = [{
                 "type": "reflection",
                 "time": now_str,
                 "source": "task_completion_hook",
                 "utility_score": 1.0,
+                "project_id": project_id,
             }]
             self._vector_store.add(
-                [experience_text], [embedding], metadata
+                [experience_text], [query_embedding], metadata
             )
             self._vector_store.save_cache(self._vector_cache_path)
 
@@ -451,7 +555,8 @@ class Memory:
     # ═════════════════════════════════════════════
 
     def recall_relevant(self, query: str, top_k: int = 3,
-                        min_score: float = 0.60) -> str:
+                        min_score: float = 0.60,
+                        current_file: str = "") -> str:
         """
         根据当前问题，召回最相关的历史片段（含时间衰减 + 召回追踪 + 效用分）。
 
@@ -463,16 +568,21 @@ class Memory:
           - 被命中的记忆 recall_count += 1, last_recalled 更新
           - 记录本轮召回的 L2 索引，供后续 reward/penalize 使用
         """
-        self._last_recalled_l2_indices = []  # 每轮重置
+        self._last_recalled_l2_texts = []  # 每轮重置
 
         if (not self.embed_client or self._vector_store is None
                 or len(self._vector_store) == 0):
             return ""
 
         try:
-            query_embedding = self.embed_client.embed(query)
+            project_id = self._project_key(current_file)
+            sanitized_query = self._sanitize_active_file(
+                query,
+                current_file=current_file,
+            )
+            query_embedding = self.embed_client.embed(sanitized_query)
             candidates = self._vector_store.search(
-                query_embedding, top_k=top_k * 3
+                query_embedding, top_k=max(top_k * 10, top_k * 3)
             )
 
             if not candidates:
@@ -485,6 +595,9 @@ class Memory:
                 semantic = r["score"]
                 meta = r.get("metadata", {})
                 mem_type = meta.get("type", "conversation")
+
+                if not self._same_project(meta, project_id):
+                    continue
 
                 # 过滤被隔离的 L2 记忆（utility_score < 0）
                 if mem_type == "reflection":
@@ -530,9 +643,9 @@ class Memory:
                     meta["last_recalled"] = now_str
                     tracking_changed = True
 
-                    # 记录本轮召回的 L2 索引（用于 reward/penalize 反馈）
+                    # 记录本轮召回的 L2 文本（用于 reward/penalize 反馈，避免索引偏移）
                     if meta.get("type") == "reflection":
-                        self._last_recalled_l2_indices.append(idx)
+                        self._last_recalled_l2_texts.append(r["chunk"])
 
                 except (ValueError, IndexError):
                     pass
@@ -566,23 +679,27 @@ class Memory:
         类似推荐系统的正反馈：当召回的经验“帮助”了 Agent 成功执行，
         就提升其效用分，使其在未来更容易被召回。
         """
-        if not self._last_recalled_l2_indices or self._vector_store is None:
+        if not self._last_recalled_l2_texts or self._vector_store is None:
             return
 
         changed = False
-        for idx in self._last_recalled_l2_indices:
-            if idx < len(self._vector_store.metadata):
-                meta = self._vector_store.metadata[idx]
-                if meta.get("type") == "reflection":
-                    old = meta.get("utility_score", 1.0)
-                    meta["utility_score"] = round(old + delta, 2)
-                    changed = True
-                    if self.verbose_feedback:
-                        logger.debug(
-                            "  [Memory] L2 奖励 +%.1f: %.2f → %.2f | %s",
-                            delta, old, meta["utility_score"],
-                            self._vector_store.chunks[idx][:40],
-                        )
+        for text in self._last_recalled_l2_texts:
+            # 通过文本匹配查找当前索引（避免因 _delete_indices 导致的索引偏移）
+            try:
+                idx = self._vector_store.chunks.index(text)
+            except ValueError:
+                continue  # 该记忆已被删除，跳过
+            meta = self._vector_store.metadata[idx]
+            if meta.get("type") == "reflection":
+                old = meta.get("utility_score", 1.0)
+                meta["utility_score"] = round(old + delta, 2)
+                changed = True
+                if self.verbose_feedback:
+                    logger.debug(
+                        "  [Memory] L2 奖励 +%.1f: %.2f → %.2f | %s",
+                        delta, old, meta["utility_score"],
+                        self._vector_store.chunks[idx][:40],
+                    )
 
         if changed:
             self._vector_store.save_cache(self._vector_cache_path)
@@ -594,22 +711,26 @@ class Memory:
         类似推荐系统的负反馈：被召回的经验可能误导了 Agent，
         降低其效用分。一旦降到 0 以下将被隔离或删除。
         """
-        if not self._last_recalled_l2_indices or self._vector_store is None:
+        if not self._last_recalled_l2_texts or self._vector_store is None:
             return
 
         changed = False
-        for idx in self._last_recalled_l2_indices:
-            if idx < len(self._vector_store.metadata):
-                meta = self._vector_store.metadata[idx]
-                if meta.get("type") == "reflection":
-                    old = meta.get("utility_score", 1.0)
-                    meta["utility_score"] = round(old - delta, 2)
-                    changed = True
-                    logger.info(
-                        "  [Memory] L2 惩罚 -%.1f: %.2f → %.2f | %s",
-                        delta, old, meta["utility_score"],
-                        self._vector_store.chunks[idx][:40],
-                    )
+        for text in self._last_recalled_l2_texts:
+            # 通过文本匹配查找当前索引（避免因 _delete_indices 导致的索引偏移）
+            try:
+                idx = self._vector_store.chunks.index(text)
+            except ValueError:
+                continue  # 该记忆已被删除，跳过
+            meta = self._vector_store.metadata[idx]
+            if meta.get("type") == "reflection":
+                old = meta.get("utility_score", 1.0)
+                meta["utility_score"] = round(old - delta, 2)
+                changed = True
+                logger.info(
+                    "  [Memory] L2 惩罚 -%.1f: %.2f → %.2f | %s",
+                    delta, old, meta["utility_score"],
+                    self._vector_store.chunks[idx][:40],
+                )
 
         if changed:
             self._vector_store.save_cache(self._vector_cache_path)
@@ -749,10 +870,11 @@ class Memory:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         for i in promoted:
             chunk = self._vector_store.chunks[i]
+            old_meta = self._vector_store.metadata[i]
             # 👑 先读后写（两步）：虽然 Python 先求值右侧再赋值，
             # 把旧值查询写在新 dict literal 里语义正确但极易误导 code review，
             # 故显式拆成两步以免未来维护者误判为"读已被覆盖的值"。
-            old_recall = self._vector_store.metadata[i].get("recall_count", 0)
+            old_recall = old_meta.get("recall_count", 0)
             logger.info("  [Memory] L3 → L2 晋升（recall=%d）: %s",
                         old_recall, chunk[:60])
             # 将 L3 直接升级为 L2（原地修改 metadata）
@@ -761,6 +883,8 @@ class Memory:
                 "time": now_str,
                 "source": "promotion",
                 "original_recall_count": old_recall,
+                "utility_score": 1.0,
+                "project_id": old_meta.get("project_id", ""),
             }
 
         self._vector_store.save_cache(self._vector_cache_path)

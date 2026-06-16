@@ -7,6 +7,7 @@ DocMaster Agent - ReAct Agent 核心
 
 import asyncio
 import json
+import os
 import queue as _thread_queue
 import re
 import time
@@ -25,6 +26,8 @@ WORD_TOOLS = {
     "ref_crossref", "fig_crossref", "fig_caption", "acronym_checker",
     "summarize_document", "analyze_document", "index_document",
 }
+
+FSM_INTERACTION_TIMEOUT = 600.0
 
 
 class Agent:
@@ -47,6 +50,7 @@ class Agent:
         dry_run: bool = False,
         memory=None,
         skill_manager=None,
+        api_mode: bool = False,
     ):
         self.llm = llm
         self.tools = tool_registry
@@ -55,6 +59,7 @@ class Agent:
         self.dry_run = dry_run
         self.memory = memory
         self.skill_manager = skill_manager
+        self.api_mode = api_mode  # API/插件模式：禁止自动关闭 Word
         self.state = AgentState.IDLE
         self.history: list[Message] = []
         self._session_tools: list[str] = []   # 本轮执行过的工具名
@@ -65,8 +70,23 @@ class Agent:
         self._token_warning = 6000   # Token 水位：触发规则压缩（4000→6000，避免过早压缩稀释 L1）
         self._token_critical = 8000  # Token 水位：触发 LLM 深度压缩
 
+        # FSM Interactive State (Human-in-the-loop)
+        import asyncio
+        self._approval_event: asyncio.Event | None = None
+        self._review_event: asyncio.Event | None = None
+        self._user_choice: str | None = None
+
         # 构建基础系统提示词（无技能上下文，启动时用）
         self._build_system_prompt()
+
+    def resume_fsm(self, action: str):
+        """前端通过此方法通知后台用户操作，并恢复挂起的 FSM 任务"""
+        logger.info(f"[Agent] FSM resume triggered with action: {action}")
+        self._user_choice = action
+        if self._approval_event:
+            self._approval_event.set()
+        if self._review_event:
+            self._review_event.set()
 
     def _build_system_prompt(self, skills_context: str = "",
                              recalled_context: str = ""):
@@ -86,7 +106,10 @@ class Agent:
 
         tool_desc = self.tools.describe()
         memory_context = (
-            self.memory.get_context_summary(recalled_context)
+            self.memory.get_context_summary(
+                recalled_context,
+                current_file=self._session_file,
+            )
             if self.memory else ""
         )
 
@@ -152,7 +175,10 @@ class Agent:
         # ── 向量记忆召回（RAG 式）──
         recalled = ""
         if self.memory:
-            recalled = self.memory.recall_relevant(user_input)
+            recalled = self.memory.recall_relevant(
+                user_input,
+                current_file=self._session_file,
+            )
             if self.verbose and recalled:
                 logger.info("📌 已召回 %d 条相关历史", recalled.count('相关度'))
 
@@ -197,7 +223,7 @@ class Agent:
 
                 intent, router_file, reason = classify_intent(
                     self.llm, user_input,
-                    history_context=self._build_router_context(),
+                    history_context=self._build_router_context(user_input),
                 )
                 logger.info("🚦 意图: %s — %s", intent.value, reason)
 
@@ -314,7 +340,16 @@ class Agent:
         if tokens < self._token_warning:
             return
 
-        keep_head = 2  # System + User
+        # 动态计算 keep_head：保留开头所有连续的 system 消息 + 第一条 user 消息
+        keep_head = 0
+        for m in self.history:
+            if m.role == Role.SYSTEM:
+                keep_head += 1
+            else:
+                break
+        # 确保第一条 user 消息也被保留
+        if keep_head < len(self.history) and self.history[keep_head].role == Role.USER:
+            keep_head += 1
         keep_tail = 4  # 最近 2 轮工具交互
 
         if len(self.history) <= keep_head + keep_tail:
@@ -535,6 +570,52 @@ class Agent:
 
         return "\n".join(parts)
 
+    def _build_timeout_observation(
+        self,
+        name: str,
+        arguments: dict,
+        stall_sec: float,
+        stall_timeout: float,
+        killed_pids: list[int],
+    ) -> str:
+        """
+        为看门狗熔断/超时构造结构化自修正引导。
+        """
+        import os
+        suggestions = [
+            "可能是由于 Microsoft Word 弹出了模态对话框（如“另存为”、“只读提示”等）导致 COM 接口阻塞。",
+            "如果是第一次运行，启动 Word 进程可能比较缓慢，可以尝试重新调用以复用已拉起的进程。",
+            "检查文件是否已被其他 Word 窗口打开，若是，请手动关闭所有 Word 窗口后重新尝试。"
+        ]
+
+        file_path = arguments.get("file_path", "")
+        if file_path:
+            abs_path = os.path.abspath(file_path)
+            suggestions.append(f"检查该文件路径是否正确: {abs_path}")
+            if not os.path.exists(abs_path):
+                suggestions.append("⚠️ 诊断结果: 该文件实际上不存在！请使用正确且存在的文件路径。")
+            else:
+                try:
+                    with open(abs_path, "a") as f:
+                        pass
+                except PermissionError:
+                    suggestions.append("⚠️ 诊断结果: 该文件目前正被其他程序独占（Permission Denied）。请关闭打开了该文档的所有 Word 实例或其它程序，然后再重试。")
+                except Exception:
+                    pass
+
+        parts = [
+            f"❌ 工具 {name} 执行进度卡死超过 {stall_timeout:.1f} 秒，已被看门狗强杀。",
+            f"错误分类: 工具超时/熔断 (Watchdog Timeout)",
+            f"错误详情: 连续 {stall_sec:.1f} 秒无心跳，底层 Word 进程已强制熔断（击杀 PID: {killed_pids or '未知'}）",
+            f"调用参数: {', '.join(f'{k}={v!r}' for k, v in arguments.items())}",
+            "",
+            "修正建议:",
+        ]
+        for i, s in enumerate(suggestions, 1):
+            parts.append(f"  {i}. {s}")
+
+        return "\n".join(parts)
+
     # ─────────────────────────────────────────────
     # 增强版工具执行（含重试跟踪 + 自动重试）
     # ─────────────────────────────────────────────
@@ -576,8 +657,7 @@ class Agent:
 
         # 重试跟踪：基于工具名计数（同名工具连续失败才计数）
         max_attempts = 3
-        attempt = self._retry_counts.get(name, 0) + 1
-        self._retry_counts[name] = attempt
+        attempt = self._retry_counts.get(name, 0)
 
         # ── Skill Config 注入：将 config 中该工具对应的参数作为默认值注入 ──
         # LLM 显式传递的参数优先级更高，不会被 config 覆盖
@@ -617,17 +697,28 @@ class Agent:
         except Exception as e:
             level, summary, _ = self._classify_error(name, e)
 
+            current_attempt = attempt + 1
+
             # Level 1 (临时性错误): 自动重试，不消耗 LLM 推理步骤
-            if level == "transient" and attempt < max_attempts:
-                wait_sec = 2 ** attempt  # 指数退避: 2s, 4s, 8s
+            if level == "transient" and current_attempt < max_attempts:
+                self._retry_counts[name] = current_attempt
+                wait_sec = 2 ** attempt  # 指数退避: 1s, 2s
                 if self.verbose:
-                    logger.warning("  ⏳ 临时性错误，%d秒后自动重试 (%d/%d)...", wait_sec, attempt, max_attempts)
-                time.sleep(wait_sec)
+                    logger.warning(
+                        "  ⏳ 临时性错误，%d秒后自动重试 (%d/%d)...",
+                        wait_sec, current_attempt, max_attempts,
+                    )
+                # 👑 修复：在 sleep 期间定期发送 progress 心跳，防止触发 watchdog
+                for i in range(wait_sec):
+                    time.sleep(1.0)
+                    tool.report_progress(0, f"临时性错误，自动重试中（等待第 {i+1}/{wait_sec} 秒）...")
                 return self._execute_tool(call_id, name, arguments)
 
             # Level 2 & 3: 构造结构化 Observation 引导 LLM 自修正
+            # 工具失败 → 递增重试计数
+            self._retry_counts[name] = min(current_attempt, max_attempts)
             error_obs = self._build_error_observation(
-                name, arguments, e, attempt, max_attempts
+                name, arguments, e, min(current_attempt, max_attempts), max_attempts
             )
             if self.verbose:
                 logger.error("  ❌ %s", summary)
@@ -658,48 +749,21 @@ class Agent:
 
         Returns:
             违规报告文本，如果没有违规则返回空字符串。
+
+        注意：Word 进程关闭已迁移到 run()/run_async() 的 finally 块，
+        作为确定性流程处理（带超时保护，不依赖 learned_rules 记忆）。
+        当前无活跃校验规则，保留方法签名供未来扩展。
         """
-        if not self._session_tools:
-            return ""
-
-        try:
-            from tools.learned_rules import extract_taboos_from_profile, _load_rules
-            # 优先从画像铁律读取，回退到旧 JSON rules
-            taboos = extract_taboos_from_profile()
-            if taboos:
-                rule_texts = taboos
-            else:
-                rules = _load_rules()
-                rule_texts = [r["rule"] for r in rules] if rules else []
-        except Exception:
-            return ""
-
-        if not rule_texts:
-            return ""
-
-        used_tools = set(self._session_tools)
-        violations = []
-
-        for rule_text in rule_texts:
-            rule_lower = rule_text.lower()
-
-            # ── 注意：Word 进程关闭已迁移到 run()/run_async() 的 finally 块，
-            #   作为确定性流程处理（带超时保护，不依赖 learned_rules 记忆）。
-            #   此处仅保留其他可扩展规则模式的位置。
-
-            # ── 未来可扩展更多规则模式 ──
-            # if "其他关键词" in rule_lower:
-            #     ...
-            _ = rule_lower  # 占位避免 lint 警告
-
-        return "\n".join(violations)
+        return ""
 
     # ─────────────────────────────────────────────
     # 确定性清理：Word 进程兜底关闭（带超时保护）
     # ─────────────────────────────────────────────
 
     def _needs_close_word(self) -> bool:
-        """是否需要兜底关闭 Word 进程。"""
+        """是否需要兜底关闭 Word 进程。API/插件模式下永远不关闭。"""
+        if self.api_mode:
+            return False
         used = set(self._session_tools)
         return bool(used & WORD_TOOLS) and "close_word" not in used
 
@@ -785,7 +849,11 @@ class Agent:
 
         # 向量记忆：存入本轮 Q+A 摘要
         if self.memory and user_input:
-            self.memory.add_to_vector(user_input, summary)
+            self.memory.add_to_vector(
+                user_input,
+                summary,
+                current_file=self._session_file,
+            )
 
     # ─────────────────────────────────────────────
     # Skill Config → 工具参数注入（Tool-Skill 分离架构）
@@ -873,53 +941,89 @@ class Agent:
                 logger.info("⚙️ 参考文献文件夹已注入会话配置: %s",
                             self._session_literature_folder)
 
-    def _build_router_context(self) -> str:
+    def _allow_memory_file_fallback(self, user_input: str = "") -> bool:
+        text = (user_input or "").lower()
+        keywords = (
+            "上次", "上一", "之前", "继续", "恢复",
+            "last", "previous", "continue", "resume",
+        )
+        return any(k in text for k in keywords)
+
+    def _build_router_context(self, user_input: str = "") -> str:
         """
         为路由器构建丰富的上下文字符串。
 
-        汇聚三种信息帮助路由器解析隐式文件引用（如"这个文档"）：
+        汇聚上下文帮助路由器解析隐式文件引用（如"这个文档"）：
           1. _session_file（当前会话已知文件路径）
-          2. memory.get_last_file()（持久化的上次处理文件）
-          3. 最近 2 条对话历史摘要（帮助解析指示代词）
+          2. 参考文献文件夹（如果当前项目已设置）
+          3. 当前文档最近历史；API 模式下不自动注入其它文档路径
         """
         parts = []
 
         # 1. 当前会话文件
         if self._session_file:
-            parts.append(f"当前会话文件: {self._session_file}")
+            parts.append(f"current_session_file: {self._session_file}")
 
         # 1.5 参考文献文件夹
         if self._session_literature_folder:
-            parts.append(f"参考文献文件夹: {self._session_literature_folder}")
+            parts.append(f"literature_folder: {self._session_literature_folder}")
 
         # 2. 记忆系统中的上次文件
         if self.memory:
+            allow_fallback = (
+                not self.api_mode
+                or (not self._session_file
+                    and self._allow_memory_file_fallback(user_input))
+            )
             last_file = self.memory.get_last_file()
-            if last_file and last_file != self._session_file:
-                parts.append(f"上次处理的文件: {last_file}")
+            if allow_fallback and last_file and last_file != self._session_file:
+                parts.append(f"previous_file: {last_file}")
 
             # 3. 最近操作摘要（帮助解析"这个""那个"等指示代词）
-            recent = self.memory.get_recent_sessions(2)
+            recent = self.memory.get_recent_sessions(5)
+            if self._session_file:
+                try:
+                    current_abs = os.path.abspath(self._session_file)
+                    recent = [
+                        s for s in recent
+                        if os.path.abspath(s.get("file", "")) == current_abs
+                    ]
+                except (TypeError, ValueError):
+                    recent = []
+            elif self.api_mode and not allow_fallback:
+                recent = []
+
+            recent = recent[-2:]
             if recent:
                 for s in recent:
                     parts.append(
-                        f"[{s['time']}] 文件: {s['file']}"
+                        f"[{s['time']}] file: {s['file']}"
                     )
 
         return "\n".join(parts)
 
     def reset(self):
         """重置 Agent 状态（保留系统提示词）"""
-        system_msg = self.history[0] if self.history else None
+        # 保留前部所有连续的 System 消息（静态根 + 动态叶，共 1~2 条）
+        system_msgs = []
+        for msg in self.history:
+            if msg.role == Role.SYSTEM:
+                system_msgs.append(msg)
+            else:
+                break
         self.history.clear()
-        if system_msg:
-            self.history.append(system_msg)
+        self.history.extend(system_msgs)
         self.state = AgentState.IDLE
         self._session_tools = []
-        self._session_file = ""
-        self._session_literature_folder = ""
+        # 不清除 _session_file 和 _session_literature_folder，它们应跨对话轮次持久
         self._retry_counts = {}
         self._active_config = {}
+
+    def reset_session(self):
+        """完全重置 Agent 状态（包括会话级文件路径，用于全新会话）"""
+        self.reset()
+        self._session_file = ""
+        self._session_literature_folder = ""
 
     # ─────────────────────────────────────────────
     # FSM Pipeline：Python 状态机驱动的 Worker 调度链
@@ -992,6 +1096,40 @@ class Agent:
             yield StreamEvent("error", "FSM 需要 delegate_task 工具，但未注册。")
             return
 
+        # Initialize interactive events
+        self._approval_event = asyncio.Event()
+        self._review_event = asyncio.Event()
+        self._user_choice = None
+
+        import os
+        from core.version_manager import VersionManager
+
+        target_file = fsm.target_file
+        version_manager = None
+        initial_commit_id = None
+        if target_file and os.path.exists(target_file):
+            try:
+                version_manager = VersionManager(target_file)
+                initial_commit = version_manager.create_checkpoint(
+                    node_id="v_0_start",
+                    description="任务开始前的原始文档",
+                    plan_state=fsm.to_dag_snapshot()
+                )
+                if initial_commit:
+                    initial_commit_id = initial_commit.get("commit_id")
+                    # Yield initial checkpoint event so frontend can render it
+                    yield StreamEvent(
+                        "checkpoint_created",
+                        "已成功创建初始保存点",
+                        metadata=initial_commit
+                    )
+                logger.info("[Agent] FSM init: Created version control checkpoint: %s", initial_commit_id)
+            except Exception as e:
+                logger.warning("[Agent] FSM init: Checkpoint registry failed: %s", e)
+
+        has_plan_node = any(n.id == "plan" for n in fsm._dag_nodes)
+        has_review_node = any(n.id == "review" for n in fsm._dag_nodes)
+
         yield StreamEvent(
             "text",
             f"🚂 FSM 接管: {fsm.intent.value} → 共 {fsm.total_steps} 步\n\n",
@@ -999,6 +1137,43 @@ class Agent:
 
         for role, objective in fsm:
             step_num = fsm.current_step + 1
+
+            if role == "Executor" and has_plan_node and self.api_mode:
+                self._approval_event.clear()
+                yield StreamEvent(
+                    "require_approval",
+                    "请确认是否开始执行此计划？",
+                    metadata={"plan": fsm.build_summary()}
+                )
+                logger.info("[Agent] FSM paused. Waiting for user approval...")
+                try:
+                    await asyncio.wait_for(
+                        self._approval_event.wait(),
+                        timeout=FSM_INTERACTION_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    yield StreamEvent(
+                        "text",
+                        "\n⏰ 等待计划确认超时，任务已中止。\n",
+                    )
+                    self.state = AgentState.FINISHED
+                    yield StreamEvent("finish", "FSM 任务确认超时。")
+                    return
+
+                if self._user_choice == "reject":
+                    yield StreamEvent("text", "\n🚫 用户已拒绝计划，任务终止。\n")
+                    if version_manager and initial_commit_id:
+                        try:
+                            version_manager.rollback_to(initial_commit_id)
+                            logger.info("[Agent] Reverted target file using version manager.")
+                        except Exception as e:
+                            logger.error(f"[Agent] Failed to revert backup: {e}")
+                    self.state = AgentState.FINISHED
+                    yield StreamEvent("finish", "FSM 任务已中止。")
+                    return
+                else:
+                    yield StreamEvent("text", "\n✅ 计划已批准，启动排版引擎...\n\n")
+
             yield StreamEvent(
                 "text",
                 f"--- Step {step_num}/{fsm.total_steps}: **{role}** ---\n",
@@ -1075,6 +1250,56 @@ class Agent:
                 f"{emoji} [{role}] {status}: {summary_text}\n\n",
             )
 
+            if version_manager:
+                try:
+                    commit = version_manager.create_checkpoint(
+                        node_id=role,
+                        description=f"完成【{role}】: {status} - {summary_text[:60]}",
+                        plan_state=fsm.to_dag_snapshot()
+                    )
+                    if commit:
+                        yield StreamEvent(
+                            "checkpoint_created",
+                            f"已生成步骤【{role}】保存点",
+                            metadata=commit
+                        )
+                except Exception as e:
+                    logger.warning("[Agent] Create step checkpoint failed: %s", e)
+
+        # Loop finishes. Review report has been fed to FSM.
+        if has_review_node and self.api_mode:
+            self._review_event.clear()
+            yield StreamEvent(
+                "require_review_confirm",
+                "请选择应用修改或撤销修改回退。",
+                metadata={"summary": fsm.build_summary()}
+            )
+            logger.info("[Agent] FSM paused. Waiting for review confirmation...")
+            try:
+                await asyncio.wait_for(
+                    self._review_event.wait(),
+                    timeout=FSM_INTERACTION_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                yield StreamEvent(
+                    "text",
+                    "\n⏰ 等待审查确认超时，保留当前修改并继续生成汇报。\n",
+                )
+                self._user_choice = "keep"
+
+            if self._user_choice == "rollback":
+                yield StreamEvent("text", "\n🔄 正在撤销所有修改，正在还原文件...\n")
+                if version_manager and initial_commit_id:
+                    try:
+                        version_manager.rollback_to(initial_commit_id)
+                        yield StreamEvent("text", "✅ 文档已成功还原至初始状态。\n")
+                    except Exception as e:
+                        yield StreamEvent("text", f"❌ 还原文件失败: {e}\n")
+                else:
+                    yield StreamEvent("text", "⚠️ 未找到备份，无法撤销。\n")
+            else:
+                yield StreamEvent("text", "\n🎉 修改已确认并应用。\n")
+
         # ── FSM 完成：让 LLM 生成用户友好的汇报 ──
         fsm_summary = fsm.build_summary()
         yield StreamEvent("text", f"\n{fsm_summary}\n\n")
@@ -1124,7 +1349,9 @@ class Agent:
         """
         # ── 会话级重置 ──
         self._session_tools = []
-        self._session_file = (self.memory.get_last_file() if self.memory else "") or ""
+        # API 模式：文档路径由前端 /session/document 设置，不从记忆中读取旧路径
+        if not self.api_mode:
+            self._session_file = (self.memory.get_last_file() if self.memory else "") or ""
         self._retry_counts = {}
         self._active_config = {}
 
@@ -1142,7 +1369,10 @@ class Agent:
         # ── 向量记忆召回 ──
         recalled = ""
         if self.memory:
-            recalled = self.memory.recall_relevant(user_input)
+            recalled = self.memory.recall_relevant(
+                user_input,
+                current_file=self._session_file,
+            )
 
         # ── 技能匹配 + Config 提取 ──
         skills_ctx = ""
@@ -1173,15 +1403,20 @@ class Agent:
                 yield StreamEvent("text", "🚦 正在分析任务意图...\n")
                 intent, router_file, reason = classify_intent(
                     self.llm, user_input,
-                    history_context=self._build_router_context(),
+                    history_context=self._build_router_context(user_input),
                 )
                 yield StreamEvent("text", f"📋 意图: **{intent.value}** — {reason}\n\n")
 
-                # 如果 Router 提取到文件路径，记录到 session
+                # 如果 Router 提取到文件路径，记录到 session，并验证存在性
                 if router_file:
-                    self._session_file = router_file
-                    # 自动检测参考文献文件夹（基于文档路径约定）
-                    self._try_detect_literature_folder()
+                    import os
+                    if os.path.exists(router_file):
+                        self._session_file = router_file
+                        # 自动检测参考文献文件夹（基于文档路径约定）
+                        self._try_detect_literature_folder()
+                    else:
+                        yield StreamEvent("text", f"⚠️ 警告：检测到的目标文件不存在 ({router_file})，正在抛弃该路径...\n")
+                        self._session_file = ""
 
                 if intent != TaskIntent.TASK_SIMPLE and self._session_file:
                     fsm = TaskFSM(intent, user_input, self._session_file)
@@ -1305,7 +1540,7 @@ class Agent:
                 task.add_done_callback(lambda _: wake_event.set())
 
                 # ── 信号驱动事件泵（非 busy-polling） ──
-                STALL_TIMEOUT = 5.0  # 基础心跳停滞阈值（秒）
+                STALL_TIMEOUT = 15.0  # 基础心跳停滞阈值（秒）
                 last_heartbeat = time.time()
                 stall_killed = False
 
@@ -1359,11 +1594,9 @@ class Agent:
                                 pass
 
                             # 结构化错误回注历史，唤醒 LLM 大脑
-                            timeout_msg = (
-                                f"❌ 工具 {tc.name} 执行进度卡死超过 {STALL_TIMEOUT:.0f} 秒，"
-                                f"底层进程已强制熔断（击杀 PID: {killed or '未知'}）。\n"
-                                f"可能原因：Word 弹出了隐藏对话框导致 COM 死锁。\n"
-                                f"请尝试：1) 重新调用该工具 2) 换一种参数 3) 跳过此步骤"
+                            # 👑 核心改进：生成结构化的自修正引导信息，包含参数诊断
+                            timeout_msg = self._build_timeout_observation(
+                                tc.name, tc.arguments, stall_sec, STALL_TIMEOUT, killed
                             )
                             self.history.append(Message(
                                 role=Role.TOOL,
@@ -1384,14 +1617,15 @@ class Agent:
                             break  # 跳出事件泵循环
                 finally:
                     # 防御性清理：无论工具怎样退出，强制弹回基础阈值
-                    if STALL_TIMEOUT != 5.0:
-                        logger.debug("  🧹 [防御性清理] 工具退出，看门狗从 %.1fs 弹回 5.0s", STALL_TIMEOUT)
-                        STALL_TIMEOUT = 5.0
+                    if STALL_TIMEOUT != 15.0:
+                        logger.debug("  🧹 [防御性清理] 工具退出，看门狗从 %.1fs 弹回 15.0s", STALL_TIMEOUT)
+                        STALL_TIMEOUT = 15.0
+                    # 调用方中断 async generator 时也必须清理回调，避免污染下一轮请求。
+                    if tool_obj is not None:
+                        tool_obj._progress_callback = None
 
                 if stall_killed:
                     # 清理回调，继续下一轮 ReAct（LLM 读到错误后决定下一步）
-                    if tool_obj is not None:
-                        tool_obj._progress_callback = None
                     continue  # 跳过本 tool_call 的结果处理，回到 for tc 循环
 
                 # 排空工具完成后残留的进度事件
@@ -1405,10 +1639,6 @@ class Agent:
                         )
                     except _thread_queue.Empty:
                         break
-
-                # 清理回调（防止跨工具泄漏）
-                if tool_obj is not None:
-                    tool_obj._progress_callback = None
 
                 # 获取执行结果
                 try:
