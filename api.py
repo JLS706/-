@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-DocMaster Agent — FastAPI Web 接口层（SSE 流式版）
+PaperOps — FastAPI Web 接口层（证据驱动科研写作工作台）
 
 将命令行 Agent 包装为 HTTP 服务，支持 Server-Sent Events 实时推送。
 
@@ -8,8 +8,9 @@ DocMaster Agent — FastAPI Web 接口层（SSE 流式版）
     python api.py
 
 接口:
-    POST /chat/stream  — SSE 流式对话（实时推送 StreamEvent）
-    POST /chat         — 兼容接口（阻塞式，已废弃）
+    POST /chat/stream  — SSE 流式 Agent 事件
+    GET  /api/projects  — 论文项目列表
+    POST /api/projects/{id}/tasks — 启动科研写作任务
     GET  /health       — 健康检查
     GET  /tools        — 查看可用工具列表
 """
@@ -19,6 +20,8 @@ import json
 import os
 import pathlib
 import sys
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -45,6 +48,106 @@ agent_instance: Agent | None = None
 tool_registry: ToolRegistry | None = None
 agent_run_lock: asyncio.Lock | None = None
 
+# 论文交付工作台的轻量持久化状态。第一版使用 JSON，后续可平滑替换为
+# SQLite/PostgreSQL；任务状态和产物仍然通过稳定的 task_id 访问。
+_FRONTEND_DIR = os.path.join(_PROJECT_ROOT, "frontend")
+_RUNTIME_DIR = os.path.join(_PROJECT_ROOT, "runtime")
+_WORKBENCH_STATE_PATH = os.path.join(_RUNTIME_DIR, "workbench_state.json")
+_workbench_state: dict = {"projects": {}, "tasks": {}}
+
+
+def _load_workbench_state() -> None:
+    global _workbench_state
+    try:
+        os.makedirs(_RUNTIME_DIR, exist_ok=True)
+        if os.path.exists(_WORKBENCH_STATE_PATH):
+            with open(_WORKBENCH_STATE_PATH, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                _workbench_state = {
+                    "projects": data.get("projects", {}),
+                    "tasks": data.get("tasks", {}),
+                }
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[Workbench] 状态加载失败，将使用空状态: %s", exc)
+
+
+def _save_workbench_state() -> None:
+    os.makedirs(_RUNTIME_DIR, exist_ok=True)
+    tmp_path = f"{_WORKBENCH_STATE_PATH}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(_workbench_state, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, _WORKBENCH_STATE_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _project_snapshot(project: dict) -> dict:
+    return dict(project)
+
+
+def _task_snapshot(task: dict) -> dict:
+    result = dict(task)
+    result["modules"] = [dict(module) for module in task.get("modules", [])]
+    result["events"] = list(task.get("events", []))[-80:]
+    return result
+
+
+def _update_task(task_id: str, **fields) -> dict | None:
+    task = _workbench_state["tasks"].get(task_id)
+    if not task:
+        return None
+    task.update(fields)
+    task["updated_at"] = _now()
+    _save_workbench_state()
+    return task
+
+
+def _append_task_event(task_id: str, message: str, event_type: str = "info") -> None:
+    task = _workbench_state["tasks"].get(task_id)
+    if not task:
+        return
+    task.setdefault("events", []).append({
+        "time": _now(),
+        "type": event_type,
+        "message": message,
+    })
+    task["events"] = task["events"][-80:]
+    task["updated_at"] = _now()
+    _save_workbench_state()
+
+
+def _set_module_status(task: dict, module_id: str, status: str, summary: str = "") -> None:
+    for module in task.get("modules", []):
+        if module.get("id") == module_id:
+            module["status"] = status
+            if summary:
+                module["summary"] = summary
+            module["updated_at"] = _now()
+            break
+
+
+def _module_for_tool(tool_name: str) -> str:
+    tool_name = tool_name.lower()
+    if "citation" in tool_name or "claim" in tool_name:
+        return "citation_check"
+    if "literature" in tool_name or "search" in tool_name or "index" in tool_name:
+        return "evidence_map"
+    if "summar" in tool_name or "analy" in tool_name or "read" in tool_name:
+        return "outline"
+    if "format" in tool_name or "reference" in tool_name or "crossref" in tool_name:
+        return "export"
+    return "section_draft"
+
+
+_load_workbench_state()
+
 
 def _agent_is_busy() -> bool:
     return agent_run_lock is not None and agent_run_lock.locked()
@@ -68,7 +171,7 @@ async def lifespan(app: FastAPI):
     print("[*] 正在初始化 Agent（复用 main.py 完整初始化逻辑）...")
     config = load_config()
     agent_instance = create_agent(config)
-    agent_instance.api_mode = True  # 插件模式：禁止自动关闭 Word（Word 是宿主）
+    agent_instance.api_mode = True  # Web 工作台模式：由服务统一管理任务生命周期
     tool_registry = agent_instance.tools
     agent_run_lock = asyncio.Lock()
     print(f"[OK] Agent 就绪，已加载 {len(tool_registry)} 个工具（api_mode=True: 不会关闭 Word）")
@@ -79,8 +182,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="DocMaster Agent API",
-    description="学术论文排版 AI 智能助手 — HTTP 接口",
+    title="PaperOps API",
+    description="证据驱动科研写作工作台 — HTTP 接口",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -140,6 +243,39 @@ class ToolInfo(BaseModel):
     parameters: list[str]
 
 
+class ProjectCreateRequest(BaseModel):
+    """创建一个科研写作项目。"""
+    title: str = "未命名科研项目"
+    research_question: str = ""
+    method_notes: str = ""
+    experiment_notes: str = ""
+    target_venue: str = ""
+    document_path: str = ""
+    literature_folder: str = ""
+    format_rule: str = "通用学术论文规范"
+
+
+class ProjectUpdateRequest(BaseModel):
+    """更新科研写作项目资料。"""
+    title: str | None = None
+    research_question: str | None = None
+    method_notes: str | None = None
+    experiment_notes: str | None = None
+    target_venue: str | None = None
+    document_path: str | None = None
+    literature_folder: str | None = None
+    format_rule: str | None = None
+
+
+class TaskCreateRequest(BaseModel):
+    """启动一次科研写作任务。"""
+    instruction: str = "根据研究素材生成论文大纲和证据地图，并起草引言或相关工作。"
+
+
+class WorkbenchActionRequest(BaseModel):
+    action: str
+
+
 # ─────────────────────────────────────────────
 # API 路由
 # ─────────────────────────────────────────────
@@ -171,6 +307,259 @@ def list_tools():
             parameters=params,
         ))
     return tools
+
+
+# ─────────────────────────────────────────────
+# 科研写作工作台：项目 / 任务 / 模块状态
+# ─────────────────────────────────────────────
+
+_WORKBENCH_MODULES = [
+    ("research_brief", "研究素材整理"),
+    ("outline", "论文大纲"),
+    ("evidence_map", "证据地图"),
+    ("section_draft", "分章节草稿"),
+    ("citation_check", "引用核验"),
+    ("export", "编辑与导出"),
+]
+
+
+async def _run_workbench_task(task_id: str, project_id: str, instruction: str) -> None:
+    """Run one project task and persist progress after every observable event."""
+    global agent_instance, agent_run_lock
+    task = _workbench_state["tasks"].get(task_id)
+    project = _workbench_state["projects"].get(project_id)
+    if not task or not project:
+        return
+
+    if agent_instance is None or agent_run_lock is None:
+        _update_task(task_id, status="error", progress=100, message="Agent 尚未初始化，请先启动服务")
+        _append_task_event(task_id, "Agent 尚未初始化", "error")
+        return
+
+    try:
+        await asyncio.wait_for(agent_run_lock.acquire(), timeout=0.01)
+    except asyncio.TimeoutError:
+        _update_task(task_id, status="error", progress=100, message="已有任务正在运行，请稍后重试")
+        _append_task_event(task_id, "任务未启动：已有任务正在运行", "error")
+        return
+
+    try:
+        document_path = project.get("document_path", "")
+        literature_folder = project.get("literature_folder", "")
+        agent_instance._session_file = document_path
+        agent_instance._session_literature_folder = literature_folder
+        agent_instance.reset()
+        agent_instance._session_file = document_path
+        agent_instance._session_literature_folder = literature_folder
+
+        _update_task(task_id, status="running", progress=4, active_module="research_brief", message="正在整理研究素材")
+        _set_module_status(task, "research_brief", "running", "正在读取研究问题、方法和实验素材")
+        _append_task_event(task_id, "任务已启动，进入研究素材整理阶段", "start")
+
+        prompt = (
+            "你是证据驱动科研写作工作台的执行 Agent。请基于用户提供的研究素材，"
+            "先组织论文结构和证据地图，再按用户要求生成指定章节的可编辑草稿。"
+            "研究结果、数据和结论不得凭空编造；缺少素材时要明确标记待补信息。"
+            "优先使用已有文档分析、RAG、摘要和引用核验工具。输出中区分大纲、证据、草稿和待确认项。\n\n"
+            f"研究问题: {project.get('research_question', '') or '未提供'}\n"
+            f"方法素材: {project.get('method_notes', '') or '未提供'}\n"
+            f"实验素材: {project.get('experiment_notes', '') or '未提供'}\n"
+            f"目标期刊/学校: {project.get('target_venue', '') or '未指定'}\n"
+            f"论文文件: {document_path or '未提供，请先说明需要文件'}\n"
+            f"参考文献目录: {literature_folder or '未提供'}\n"
+            f"格式规范: {project.get('format_rule', '通用学术论文规范')}\n"
+            f"用户任务: {instruction}"
+        )
+
+        output_parts: list[str] = []
+        event_count = 0
+        async for event in agent_instance.run_async(prompt):
+            event_count += 1
+            event_type = getattr(event, "type", "info")
+            content = str(getattr(event, "content", "") or "")
+            metadata = getattr(event, "metadata", {}) or {}
+            if event_type == "text":
+                output_parts.append(content)
+            elif event_type == "tool_start":
+                tool_name = str(metadata.get("tool", ""))
+                module_id = _module_for_tool(tool_name)
+                for module in task.get("modules", []):
+                    if module.get("status") == "running" and module.get("id") != module_id:
+                        module["status"] = "completed"
+                _set_module_status(task, module_id, "running", content or f"正在执行 {tool_name}")
+                _update_task(
+                    task_id,
+                    active_module=module_id,
+                    progress=min(92, 8 + event_count),
+                    message=content or f"正在执行 {tool_name}",
+                )
+                _append_task_event(task_id, content or f"开始执行 {tool_name}", "tool_start")
+            elif event_type == "tool_progress":
+                _update_task(task_id, progress=min(95, max(8, 8 + event_count)), message=content)
+            elif event_type == "error":
+                _append_task_event(task_id, content or "Agent 返回错误", "error")
+            elif event_type == "finish":
+                _append_task_event(task_id, content or "Agent 执行完成", "finish")
+
+        for module in task.get("modules", []):
+            if module.get("status") == "running":
+                module["status"] = "completed"
+        _update_task(
+            task_id,
+            status="completed",
+            progress=100,
+            active_module="export",
+            message="审阅任务完成，可查看报告并继续发起修改",
+            output="".join(output_parts)[-20000:],
+        )
+        project["last_task_id"] = task_id
+        project["status"] = "ready"
+        project["updated_at"] = _now()
+        _save_workbench_state()
+    except Exception as exc:
+        logger.exception("[Workbench] task failed: %s", task_id)
+        _update_task(task_id, status="error", progress=100, message=str(exc))
+        _append_task_event(task_id, f"任务失败: {exc}", "error")
+        project["status"] = "error"
+        project["updated_at"] = _now()
+        _save_workbench_state()
+    finally:
+        if agent_run_lock.locked():
+            agent_run_lock.release()
+
+
+@app.get("/api/projects")
+def list_workbench_projects():
+    projects = sorted(
+        _workbench_state["projects"].values(),
+        key=lambda item: item.get("updated_at", ""),
+        reverse=True,
+    )
+    return {"projects": [_project_snapshot(project) for project in projects]}
+
+
+@app.post("/api/projects")
+def create_workbench_project(req: ProjectCreateRequest):
+    project_id = f"p_{uuid.uuid4().hex[:12]}"
+    now = _now()
+    project = {
+        "id": project_id,
+        "title": req.title.strip() or "未命名科研项目",
+        "research_question": req.research_question.strip(),
+        "method_notes": req.method_notes.strip(),
+        "experiment_notes": req.experiment_notes.strip(),
+        "target_venue": req.target_venue.strip(),
+        "document_path": req.document_path.strip(),
+        "literature_folder": req.literature_folder.strip(),
+        "format_rule": req.format_rule.strip() or "通用学术论文规范",
+        "status": "draft",
+        "last_task_id": "",
+        "created_at": now,
+        "updated_at": now,
+    }
+    _workbench_state["projects"][project_id] = project
+    _save_workbench_state()
+    return {"success": True, "project": _project_snapshot(project)}
+
+
+@app.get("/api/projects/{project_id}")
+def get_workbench_project(project_id: str):
+    project = _workbench_state["projects"].get(project_id)
+    if not project:
+        return {"success": False, "error": "项目不存在"}
+    tasks = [
+        _task_snapshot(task)
+        for task in _workbench_state["tasks"].values()
+        if task.get("project_id") == project_id
+    ]
+    tasks.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return {"success": True, "project": _project_snapshot(project), "tasks": tasks[:20]}
+
+
+@app.patch("/api/projects/{project_id}")
+def update_workbench_project(project_id: str, req: ProjectUpdateRequest):
+    project = _workbench_state["projects"].get(project_id)
+    if not project:
+        return {"success": False, "error": "项目不存在"}
+    payload = req.model_dump(exclude_unset=True) if hasattr(req, "model_dump") else req.dict(exclude_unset=True)
+    for key, value in payload.items():
+        if value is not None:
+            project[key] = value.strip() if isinstance(value, str) else value
+    project["updated_at"] = _now()
+    _save_workbench_state()
+    return {"success": True, "project": _project_snapshot(project)}
+
+
+@app.post("/api/projects/{project_id}/tasks")
+async def create_workbench_task(project_id: str, req: TaskCreateRequest):
+    project = _workbench_state["projects"].get(project_id)
+    if not project:
+        return {"success": False, "error": "项目不存在"}
+    running = any(
+        task.get("project_id") == project_id and task.get("status") == "running"
+        for task in _workbench_state["tasks"].values()
+    )
+    if running:
+        return {"success": False, "error": "该项目已有任务正在运行"}
+
+    task_id = f"t_{uuid.uuid4().hex[:12]}"
+    now = _now()
+    task = {
+        "id": task_id,
+        "project_id": project_id,
+        "instruction": req.instruction.strip() or "根据研究素材生成论文大纲和证据地图，并起草引言或相关工作",
+        "status": "queued",
+        "progress": 0,
+        "active_module": "research_brief",
+        "message": "任务排队中",
+        "output": "",
+        "events": [],
+        "modules": [
+            {"id": module_id, "label": label, "status": "waiting", "summary": "等待执行"}
+            for module_id, label in _WORKBENCH_MODULES
+        ],
+        "created_at": now,
+        "updated_at": now,
+    }
+    _workbench_state["tasks"][task_id] = task
+    project["status"] = "processing"
+    project["last_task_id"] = task_id
+    project["updated_at"] = now
+    _save_workbench_state()
+    asyncio.create_task(_run_workbench_task(task_id, project_id, task["instruction"]))
+    return {"success": True, "task": _task_snapshot(task)}
+
+
+@app.get("/api/tasks/{task_id}")
+def get_workbench_task(task_id: str):
+    task = _workbench_state["tasks"].get(task_id)
+    if not task:
+        return {"success": False, "error": "任务不存在"}
+    return {"success": True, "task": _task_snapshot(task)}
+
+
+@app.post("/api/tasks/{task_id}/action")
+async def workbench_task_action(task_id: str, req: WorkbenchActionRequest):
+    task = _workbench_state["tasks"].get(task_id)
+    if not task:
+        return {"success": False, "error": "任务不存在"}
+    action = req.action.strip().lower()
+    if action not in {"approve", "reject", "rollback", "keep"}:
+        return {"success": False, "error": "不支持的任务动作"}
+    if agent_instance is not None:
+        agent_instance.resume_fsm(action)
+    _append_task_event(task_id, f"用户动作: {action}", "action")
+    return {"success": True, "action": action}
+
+
+@app.get("/", include_in_schema=False)
+def workbench_home():
+    """论文交付工作台首页。"""
+    return FileResponse(os.path.join(_FRONTEND_DIR, "index.html"))
+
+
+if os.path.isdir(_FRONTEND_DIR):
+    app.mount("/workbench-static", StaticFiles(directory=_FRONTEND_DIR), name="workbench-static")
 
 
 @app.post("/chat/stream")
@@ -538,63 +927,5 @@ def register_manifest_automatically():
 
 if __name__ == "__main__":
     import uvicorn
-    import threading
-    
-    # 1. 自动向注册表写入 Word Add-in 加载项
-    register_manifest_automatically()
-    
-    # 2. 启动后台 uvicorn 服务线程
-    def start_server():
-        uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
-        
-    server_thread = threading.Thread(target=start_server, daemon=True)
-    server_thread.start()
-    
-    # 3. 弹出小型现代控制中心 GUI，提供一键关闭服务并退出的方式
-    try:
-        import tkinter as tk
-        
-        root = tk.Tk()
-        root.title("DocMaster 助手")
-        root.geometry("320x160")
-        root.resizable(False, False)
-        root.configure(bg="#1e1e2e")
-        root.attributes("-topmost", True)
-        
-        # 居中显示窗口
-        screen_width = root.winfo_screenwidth()
-        screen_height = root.winfo_screenheight()
-        x = (screen_width / 2) - (320 / 2)
-        y = (screen_height / 2) - (160 / 2)
-        root.geometry(f"320x160+{int(x)}+{int(y)}")
-        
-        # UI 组件
-        lbl_title = tk.Label(
-            root, text="📝 DocMaster 排版精灵",
-            font=("Outfit", 14, "bold"), fg="#89b4fa", bg="#1e1e2e"
-        )
-        lbl_title.pack(pady=15)
-        
-        lbl_status = tk.Label(
-            root, text="● 服务已启动，后台运行中 (Port: 8000)",
-            font=("Segoe UI", 10), fg="#a6e3a1", bg="#1e1e2e"
-        )
-        lbl_status.pack(pady=5)
-        
-        def on_exit():
-            root.destroy()
-            sys.exit(0)
-            
-        btn_close = tk.Button(
-            root, text="停止并退出", command=on_exit,
-            font=("Segoe UI", 10, "bold"), fg="#11111b", bg="#f38ba8",
-            activebackground="#f38ba8", activeforeground="#11111b",
-            bd=0, padx=12, pady=5, cursor="hand2"
-        )
-        btn_close.pack(pady=15)
-        
-        root.protocol("WM_DELETE_WINDOW", on_exit)
-        root.mainloop()
-    except Exception as e:
-        print(f"[!] 无法拉起控制面板 GUI ({e})，将在命令行中阻塞运行。")
-        server_thread.join()
+    # PaperOps 使用浏览器工作台，不再注册 Word Add-in，也不弹出旧版 Tk 控制面板。
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")

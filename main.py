@@ -90,10 +90,17 @@ def create_agent(config: dict, dry_run: bool = False):
     from tools.word_cleanup import CloseWordTool
     from tools.heading_styler import ApplyHeadingStylesTool
     from tools.delegate import DelegateTaskTool
-    from tools.tool_creator import (
-        CreateToolTool, ApproveToolTool, ListCustomToolsTool, RejectToolTool,
-        load_custom_tools,
-    )
+    # 动态工具创建属于旧版实验能力。当前副本没有 tool_creator.py，
+    # PaperOps 主链路也不依赖它，因此按可选能力加载，避免阻塞 Agent 启动。
+    try:
+        from tools.tool_creator import (
+            CreateToolTool, ApproveToolTool, ListCustomToolsTool, RejectToolTool,
+            load_custom_tools,
+        )
+        tool_creator_available = True
+    except ModuleNotFoundError:
+        tool_creator_available = False
+        logger.warning("未找到 tools.tool_creator，跳过动态工具创建能力")
 
     # 初始化 LLM
     llm_config = config.get("llm", {})
@@ -147,14 +154,15 @@ def create_agent(config: dict, dry_run: bool = False):
     registry.register(CloseWordTool())                # Word 进程清理
     registry.register(SummarizeDocumentTool())         # 全文摘要(Map-Reduce)
     registry.register(ApplyHeadingStylesTool())        # 标题样式批量应用（结构推演后使用）
-    registry.register(CreateToolTool())                # 🧬 动态工具创建
-    registry.register(ApproveToolTool(registry))       # 🧬 审批工具
-    registry.register(ListCustomToolsTool())            # 🧬 列出自定义工具
-    registry.register(RejectToolTool())                # 🧬 否决工具
-    
-    # 自动加载已激活的自定义工具
-    custom_count = load_custom_tools(registry)
-    logger.info("已成功加载 %d 个自定义工具", custom_count)
+    if tool_creator_available:
+        registry.register(CreateToolTool())             # 🧬 动态工具创建（旧版可选）
+        registry.register(ApproveToolTool(registry))    # 🧬 审批工具
+        registry.register(ListCustomToolsTool())        # 🧬 列出自定义工具
+        registry.register(RejectToolTool())             # 🧬 否决工具
+
+        # 自动加载已激活的自定义工具
+        custom_count = load_custom_tools(registry)
+        logger.info("已成功加载 %d 个自定义工具", custom_count)
 
     # 🐝 蜂群派发器：只有 Coordinator（主 Agent）拥有此工具
     # Worker 通过 registry.exclude({"delegate_task"}) 获得无此工具的子集

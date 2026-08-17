@@ -31,4 +31,6 @@ Thumbs.db
 
 # Runtime data
 memory/
+runtime/
+.docmaster_versions/
 .env

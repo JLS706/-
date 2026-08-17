@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PaperOps · 科研写作工作台</title>
+  <link rel="stylesheet" href="/workbench-static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">P</div>
+        <div>
+          <div class="brand-name">PaperOps</div>
+          <div class="brand-subtitle">证据驱动科研写作</div>
+        </div>
+      </div>
+
+      <button class="primary-button full-width" id="newProjectButton">＋ 新建论文项目</button>
+
+      <div class="sidebar-section-title">最近项目</div>
+      <div id="projectList" class="project-list">
+        <div class="empty-sidebar">还没有项目</div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="status-dot"></div>
+        <span id="serviceStatus">正在检查服务</span>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">RESEARCH WRITING</div>
+          <h1 id="pageTitle">科研写作工作台</h1>
+          <p id="pageSubtitle">从研究素材开始，逐步生成论文大纲、证据地图和可编辑章节草稿。</p>
+        </div>
+        <div class="topbar-actions">
+          <span class="pill" id="projectStatus">未选择项目</span>
+          <button class="ghost-button" id="refreshButton">刷新</button>
+        </div>
+      </header>
+
+      <section id="emptyState" class="empty-state">
+        <div class="empty-icon">✦</div>
+        <h2>从一个科研项目开始</h2>
+        <p>先输入研究问题、方法、实验素材和参考文献，系统会逐步生成论文结构与章节草稿。</p>
+        <button class="primary-button" id="emptyNewProjectButton">创建项目</button>
+      </section>
+
+      <section id="workspace" class="workspace hidden">
+        <div class="workspace-grid">
+          <div class="content-column">
+            <section class="panel project-input-panel">
+              <div class="panel-heading">
+                <div>
+                  <div class="section-kicker">PROJECT INPUT</div>
+                  <h2>研究素材</h2>
+                </div>
+                <span class="quiet-label">结构化输入</span>
+              </div>
+              <div class="input-grid">
+                <label class="field field-wide">
+                  <span>研究问题</span>
+                  <textarea id="researchQuestion" rows="2" placeholder="你想解决什么问题？研究对象和核心假设是什么？"></textarea>
+                </label>
+                <label class="field">
+                  <span>方法素材</span>
+                  <textarea id="methodNotes" rows="4" placeholder="记录方法、模型、系统或实验流程"></textarea>
+                </label>
+                <label class="field">
+                  <span>实验素材</span>
+                  <textarea id="experimentNotes" rows="4" placeholder="记录数据集、指标、结果和待补内容"></textarea>
+                </label>
+                <label class="field">
+                  <span>参考文献目录</span>
+                  <input id="literatureFolder" type="text" placeholder="可选：C:\\papers\\refs" />
+                </label>
+                <label class="field">
+                  <span>目标期刊 / 学校</span>
+                  <input id="targetVenue" type="text" placeholder="例如：IEEE TII / 南邮硕士论文" />
+                </label>
+                <label class="field">
+                  <span>已有论文路径（可选）</span>
+                  <input id="documentPath" type="text" placeholder="已有草稿：C:\\papers\\draft.docx" />
+                </label>
+                <label class="field">
+                  <span>格式规范</span>
+                  <input id="formatRule" type="text" placeholder="学校模板 / 期刊规范" />
+                </label>
+              </div>
+              <div class="save-row">
+                <span id="saveHint">研究素材保存后可用于生成大纲和章节草稿</span>
+                <button class="secondary-button" id="saveProjectButton">保存资料</button>
+              </div>
+            </section>
+
+            <section class="panel task-panel">
+              <div class="panel-heading">
+                <div>
+                  <div class="section-kicker">DELIVERY TASK</div>
+                  <h2>启动一次写作任务</h2>
+                </div>
+                <span class="task-id" id="taskIdLabel">暂无任务</span>
+              </div>
+              <label class="field">
+                <span>本次任务</span>
+                <textarea id="taskInstruction" rows="3">根据研究素材生成论文大纲和证据地图，并起草引言或相关工作。</textarea>
+              </label>
+              <div class="task-actions">
+                <button class="primary-button" id="startTaskButton">开始生成</button>
+                <span class="task-note">Agent 会按章节工作，结果会保存在任务记录中。</span>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div>
+                  <div class="section-kicker">WORKFLOW</div>
+                  <h2>写作流程</h2>
+                </div>
+                <span class="quiet-label">可恢复任务</span>
+              </div>
+              <div id="moduleList" class="module-list"></div>
+            </section>
+
+            <section class="panel output-panel">
+              <div class="panel-heading">
+                <div>
+                  <div class="section-kicker">REPORT</div>
+                  <h2>生成结果</h2>
+                </div>
+                <button class="ghost-button" id="copyOutputButton">复制</button>
+              </div>
+              <pre id="taskOutput" class="output-box">完成任务后，这里会显示大纲、证据地图和章节草稿。</pre>
+            </section>
+          </div>
+
+          <aside class="right-column">
+            <section class="panel progress-panel">
+              <div class="panel-heading compact">
+                <div>
+                  <div class="section-kicker">LIVE STATUS</div>
+                  <h2>任务状态</h2>
+                </div>
+                <span id="progressValue" class="progress-value">0%</span>
+              </div>
+              <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+              <div id="taskMessage" class="progress-message">等待启动任务</div>
+              <div class="status-summary">
+                <div><span>项目状态</span><strong id="summaryProjectStatus">草稿</strong></div>
+                <div><span>当前模块</span><strong id="summaryActiveModule">—</strong></div>
+              </div>
+            </section>
+
+            <section class="panel activity-panel">
+              <div class="panel-heading compact">
+                <div>
+                  <div class="section-kicker">ACTIVITY</div>
+                  <h2>执行日志</h2>
+                </div>
+              </div>
+              <div id="activityList" class="activity-list"><div class="activity-empty">暂无执行记录</div></div>
+            </section>
+
+            <section class="panel history-panel">
+              <div class="panel-heading compact">
+                <div>
+                  <div class="section-kicker">HISTORY</div>
+                  <h2>历史任务</h2>
+                </div>
+              </div>
+              <div id="historyList" class="history-list"><div class="activity-empty">暂无历史任务</div></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="projectModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-heading">
+        <div>
+          <div class="section-kicker">NEW PROJECT</div>
+          <h2>新建科研项目</h2>
+        </div>
+        <button class="icon-button" id="closeModalButton">×</button>
+      </div>
+      <label class="field"><span>项目名称</span><input id="newProjectTitle" type="text" placeholder="例如：多智能体边缘协同论文" /></label>
+      <div class="modal-actions">
+        <button class="ghost-button" id="cancelModalButton">取消</button>
+        <button class="primary-button" id="createProjectButton">创建项目</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/workbench-static/app.js"></script>
+</body>
+</html>
